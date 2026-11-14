@@ -91,19 +91,64 @@ def get_embedded_assets_zip() -> Optional[Path]:
     return None
 
 
+def is_compiled_binary() -> bool:
+    if ("__compiled__" in globals()) or getattr(sys, "frozen", False):
+        return True
+    if IS_WINDOWS and sys.argv and sys.argv[0] and Path(sys.argv[0]).suffix.lower() == ".exe":
+        return True
+    return False
+
+
+def get_real_executable() -> Path:
+    for env_key in ("NUITKA_ONEFILE_BINARY", "APPIMAGE"):
+        val = os.environ.get(env_key)
+        if val and Path(val).exists():
+            return Path(val).resolve()
+    parent_pid = os.environ.get("NUITKA_ONEFILE_PARENT")
+    if parent_pid and parent_pid.isdigit():
+        if IS_WINDOWS:
+            try:
+                kernel32 = ctypes.windll.kernel32
+                h_proc = kernel32.OpenProcess(0x1000, False, int(parent_pid))
+                if h_proc:
+                    try:
+                        buf = ctypes.create_unicode_buffer(4096)
+                        size = wintypes.DWORD(4096)
+                        if kernel32.QueryFullProcessImageNameW(h_proc, 0, buf, ctypes.byref(size)):
+                            p = Path(buf.value)
+                            if p.exists():
+                                return p.resolve()
+                    finally:
+                        kernel32.CloseHandle(h_proc)
+            except Exception:
+                pass
+        elif IS_LINUX:
+            try:
+                p = Path(f"/proc/{parent_pid}/exe").resolve()
+                if p.exists():
+                    return p
+            except Exception:
+                pass
+    if is_compiled_binary() and sys.argv and sys.argv[0]:
+        arg_path = Path(sys.argv[0])
+        if arg_path.exists():
+            return arg_path.resolve()
+        found = shutil.which(sys.argv[0])
+        if found:
+            return Path(found).resolve()
+        return arg_path.resolve()
+    return Path(sys.executable).resolve()
+
+
 def get_work_dir() -> Path:
     if IS_WINDOWS:
         # ProgramData общая для админа и службы SYSTEM
-        is_compiled = ("__compiled__" in globals()) or bool(
-            sys.argv and sys.argv[0] and Path(sys.argv[0]).suffix.lower() == ".exe"
-        )
-        if is_compiled or (get_embedded_assets_zip() is not None and not (Path(__file__).resolve().parent / "bin" / "winws.exe").exists()):
+        if is_compiled_binary() or (get_embedded_assets_zip() is not None and not (Path(__file__).resolve().parent / "bin" / "winws.exe").exists()):
             prog_data = Path(os.environ.get("ProgramData", r"C:\ProgramData"))
             return prog_data / "UnfitZapret"
         return Path(__file__).resolve().parent
 
-    is_compiled = ("__compiled__" in globals()) or getattr(sys, "frozen", False)
-    if is_compiled:
+    if is_compiled_binary():
         if hasattr(os, "geteuid") and os.geteuid() == 0:
             return Path("/opt/unfit-zapret")
         return Path.home() / ".local" / "share" / "unfit-zapret"
@@ -254,13 +299,16 @@ def is_admin() -> bool:
 
 def relaunch_as_admin() -> None:
     if IS_WINDOWS:
-        argv0 = Path(sys.argv[0]).resolve() if sys.argv else None
-        is_compiled = argv0 is not None and argv0.suffix.lower() == ".exe"
-        if is_compiled:
+        if is_compiled_binary():
+            exe_path = get_real_executable()
             extra_args = " ".join(f'"{a}"' for a in sys.argv[1:]) if len(sys.argv) > 1 else None
-            ctypes.windll.shell32.ShellExecuteW(None, "runas", str(argv0), extra_args, str(argv0.parent), 1)
+            ctypes.windll.shell32.ShellExecuteW(None, "runas", str(exe_path), extra_args, str(exe_path.parent), 1)
         else:
-            script_path = os.path.abspath(sys.argv[0])
+            script_path = (
+                Path(sys.argv[0]).resolve()
+                if (sys.argv and sys.argv[0] and Path(sys.argv[0]).exists())
+                else (Path(__file__).resolve().parent / "zapret_manager.py").resolve()
+            )
             py_exe = sys.executable
             pyw = Path(py_exe).with_name("pythonw.exe")
             if pyw.exists() and "--console" not in sys.argv:
@@ -268,22 +316,30 @@ def relaunch_as_admin() -> None:
             args = f'"{script_path}"'
             if len(sys.argv) > 1:
                 args += " " + " ".join(f'"{a}"' for a in sys.argv[1:])
-            ctypes.windll.shell32.ShellExecuteW(None, "runas", py_exe, args, str(Path(script_path).parent), 1)
+            ctypes.windll.shell32.ShellExecuteW(None, "runas", py_exe, args, str(script_path.parent), 1)
         return
 
-    argv0 = Path(sys.argv[0]).resolve() if sys.argv else Path(sys.executable).resolve()
-    is_compiled = ("__compiled__" in globals()) or getattr(sys, "frozen", False)
-    target_cmd = [str(argv0), *sys.argv[1:]] if is_compiled else [sys.executable, os.path.abspath(sys.argv[0]), *sys.argv[1:]]
-    if shutil.which("pkexec") and (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
-        env_args = []
-        for k in ("DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR", "QT_QPA_PLATFORM"):
-            v = os.environ.get(k)
-            if v:
-                env_args.append(f"{k}={v}")
-        cmd = ["pkexec", "env", *env_args, *target_cmd] if env_args else ["pkexec", *target_cmd]
-        subprocess.Popen(cmd, start_new_session=True)
-    elif shutil.which("sudo"):
-        subprocess.Popen(["sudo", "-E", *target_cmd], start_new_session=True)
+    extra_args = [a for a in sys.argv[1:] if a != "--elevated"]
+    if is_compiled_binary():
+        target_cmd = [str(get_real_executable()), *extra_args, "--elevated"]
+    else:
+        script = str((Path(__file__).resolve().parent / "zapret_manager.py").resolve())
+        target_cmd = [sys.executable, script, *extra_args, "--elevated"]
+    try:
+        has_tty = bool(sys.stdin and sys.stdin.isatty())
+        if not has_tty and shutil.which("pkexec") and (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+            env_pairs = [
+                f"{k}={os.environ[k]}"
+                for k in ("DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "QT_QPA_PLATFORM")
+                if os.environ.get(k)
+            ]
+            os.execvp("pkexec", ["pkexec", "env", *env_pairs, *target_cmd] if env_pairs else ["pkexec", *target_cmd])
+        elif shutil.which("sudo"):
+            os.execvp("sudo", ["sudo", "-E", *target_cmd])
+        elif shutil.which("pkexec"):
+            os.execvp("pkexec", ["pkexec", *target_cmd])
+    except Exception:
+        pass
 
 
 if IS_WINDOWS:
@@ -652,11 +708,11 @@ def get_winws_args(strategy_str: str, config: dict, log_cb: Optional[Callable[[s
     if "--dpi-desync-split-seqovl=681" in resolved_strategy and not any(
         x.startswith("--dpi-desync-split-seqovl-pattern") for x in strat_parts
     ):
-        strat_parts.append(f'--dpi-desync-split-seqovl-pattern={BIN_DIR / "tls_clienthello_www_google_com.bin"}')
+        strat_parts.append(f'--dpi-desync-split-seqovl-pattern={(BIN_DIR / "tls_clienthello_www_google_com.bin").as_posix()}')
     elif "--dpi-desync-split-seqovl=664" in resolved_strategy and not any(
         x.startswith("--dpi-desync-split-seqovl-pattern") for x in strat_parts
     ):
-        strat_parts.append(f'--dpi-desync-split-seqovl-pattern={BIN_DIR / "tls_clienthello_max_ru.bin"}')
+        strat_parts.append(f'--dpi-desync-split-seqovl-pattern={(BIN_DIR / "tls_clienthello_max_ru.bin").as_posix()}')
 
     engine_bin = str(get_engine_binary())
     if IS_WINDOWS:
@@ -681,69 +737,69 @@ def get_winws_args(strategy_str: str, config: dict, log_cb: Optional[Callable[[s
         "--filter-l7=discord,stun",
         "--dpi-desync=fake",
         "--dpi-desync-repeats=6",
-        f'--dpi-desync-fake-discord={BIN_DIR / "quic_initial_www_google_com.bin"}',
-        f'--dpi-desync-fake-stun={BIN_DIR / "quic_initial_www_google_com.bin"}',
+        f'--dpi-desync-fake-discord={(BIN_DIR / "quic_initial_www_google_com.bin").as_posix()}',
+        f'--dpi-desync-fake-stun={(BIN_DIR / "quic_initial_www_google_com.bin").as_posix()}',
         "--new",
         # UDP 443 General
         "--filter-udp=443",
-        f'--hostlist={LISTS_DIR / "list-general.txt"}',
-        f'--hostlist={LISTS_DIR / "list-general-user.txt"}',
-        f'--hostlist-exclude={LISTS_DIR / "list-exclude.txt"}',
-        f'--hostlist-exclude={LISTS_DIR / "list-exclude-user.txt"}',
-        f'--ipset-exclude={LISTS_DIR / "ipset-exclude.txt"}',
-        f'--ipset-exclude={LISTS_DIR / "ipset-exclude-user.txt"}',
+        f'--hostlist={(LISTS_DIR / "list-general.txt").as_posix()}',
+        f'--hostlist={(LISTS_DIR / "list-general-user.txt").as_posix()}',
+        f'--hostlist-exclude={(LISTS_DIR / "list-exclude.txt").as_posix()}',
+        f'--hostlist-exclude={(LISTS_DIR / "list-exclude-user.txt").as_posix()}',
+        f'--ipset-exclude={(LISTS_DIR / "ipset-exclude.txt").as_posix()}',
+        f'--ipset-exclude={(LISTS_DIR / "ipset-exclude-user.txt").as_posix()}',
         "--dpi-desync=fake",
         "--dpi-desync-repeats=11",
-        f'--dpi-desync-fake-quic={BIN_DIR / "quic_initial_www_google_com.bin"}',
+        f'--dpi-desync-fake-quic={(BIN_DIR / "quic_initial_www_google_com.bin").as_posix()}',
         "--new",
         # TCP Discord Media
         "--filter-tcp=2053,2083,2087,2096,8443",
         "--hostlist-domains=discord.media",
-        f'--dpi-desync-fake-tls={BIN_DIR / "tls_clienthello_www_google_com.bin"}',
+        f'--dpi-desync-fake-tls={(BIN_DIR / "tls_clienthello_www_google_com.bin").as_posix()}',
         *strat_parts,
         "--new",
         # TCP Google & Gemini
         "--filter-tcp=443",
-        f'--hostlist={LISTS_DIR / "list-google.txt"}',
-        f'--hostlist={LISTS_DIR / "list-gemini.txt"}',
+        f'--hostlist={(LISTS_DIR / "list-google.txt").as_posix()}',
+        f'--hostlist={(LISTS_DIR / "list-gemini.txt").as_posix()}',
         "--ip-id=zero",
-        f'--dpi-desync-fake-tls={BIN_DIR / "tls_clienthello_www_google_com.bin"}',
+        f'--dpi-desync-fake-tls={(BIN_DIR / "tls_clienthello_www_google_com.bin").as_posix()}',
         *strat_parts,
         "--new",
         # TCP General (HTTP/HTTPS)
         "--filter-tcp=80,443",
-        f'--hostlist={LISTS_DIR / "list-general.txt"}',
-        f'--hostlist={LISTS_DIR / "list-general-user.txt"}',
-        f'--hostlist-exclude={LISTS_DIR / "list-exclude.txt"}',
-        f'--hostlist-exclude={LISTS_DIR / "list-exclude-user.txt"}',
-        f'--ipset-exclude={LISTS_DIR / "ipset-exclude.txt"}',
-        f'--ipset-exclude={LISTS_DIR / "ipset-exclude-user.txt"}',
-        f'--dpi-desync-fake-tls={BIN_DIR / "stun.bin"}',
-        f'--dpi-desync-fake-tls={BIN_DIR / "tls_clienthello_www_google_com.bin"}',
-        f'--dpi-desync-fake-http={BIN_DIR / "tls_clienthello_max_ru.bin"}',
+        f'--hostlist={(LISTS_DIR / "list-general.txt").as_posix()}',
+        f'--hostlist={(LISTS_DIR / "list-general-user.txt").as_posix()}',
+        f'--hostlist-exclude={(LISTS_DIR / "list-exclude.txt").as_posix()}',
+        f'--hostlist-exclude={(LISTS_DIR / "list-exclude-user.txt").as_posix()}',
+        f'--ipset-exclude={(LISTS_DIR / "ipset-exclude.txt").as_posix()}',
+        f'--ipset-exclude={(LISTS_DIR / "ipset-exclude-user.txt").as_posix()}',
+        f'--dpi-desync-fake-tls={(BIN_DIR / "stun.bin").as_posix()}',
+        f'--dpi-desync-fake-tls={(BIN_DIR / "tls_clienthello_www_google_com.bin").as_posix()}',
+        f'--dpi-desync-fake-http={(BIN_DIR / "tls_clienthello_max_ru.bin").as_posix()}',
         *strat_parts,
         "--new",
         # UDP Fallback (ipset-all)
         "--filter-udp=443",
-        f'--ipset={LISTS_DIR / "ipset-all.txt"}',
-        f'--hostlist-exclude={LISTS_DIR / "list-exclude.txt"}',
-        f'--hostlist-exclude={LISTS_DIR / "list-exclude-user.txt"}',
-        f'--ipset-exclude={LISTS_DIR / "ipset-exclude.txt"}',
-        f'--ipset-exclude={LISTS_DIR / "ipset-exclude-user.txt"}',
+        f'--ipset={(LISTS_DIR / "ipset-all.txt").as_posix()}',
+        f'--hostlist-exclude={(LISTS_DIR / "list-exclude.txt").as_posix()}',
+        f'--hostlist-exclude={(LISTS_DIR / "list-exclude-user.txt").as_posix()}',
+        f'--ipset-exclude={(LISTS_DIR / "ipset-exclude.txt").as_posix()}',
+        f'--ipset-exclude={(LISTS_DIR / "ipset-exclude-user.txt").as_posix()}',
         "--dpi-desync=fake",
         "--dpi-desync-repeats=11",
-        f'--dpi-desync-fake-quic={BIN_DIR / "quic_initial_www_google_com.bin"}',
+        f'--dpi-desync-fake-quic={(BIN_DIR / "quic_initial_www_google_com.bin").as_posix()}',
         "--new",
         # TCP Fallback (ipset-all)
         "--filter-tcp=80,443,8443",
-        f'--ipset={LISTS_DIR / "ipset-all.txt"}',
-        f'--hostlist-exclude={LISTS_DIR / "list-exclude.txt"}',
-        f'--hostlist-exclude={LISTS_DIR / "list-exclude-user.txt"}',
-        f'--ipset-exclude={LISTS_DIR / "ipset-exclude.txt"}',
-        f'--ipset-exclude={LISTS_DIR / "ipset-exclude-user.txt"}',
-        f'--dpi-desync-fake-tls={BIN_DIR / "stun.bin"}',
-        f'--dpi-desync-fake-tls={BIN_DIR / "tls_clienthello_www_google_com.bin"}',
-        f'--dpi-desync-fake-http={BIN_DIR / "tls_clienthello_max_ru.bin"}',
+        f'--ipset={(LISTS_DIR / "ipset-all.txt").as_posix()}',
+        f'--hostlist-exclude={(LISTS_DIR / "list-exclude.txt").as_posix()}',
+        f'--hostlist-exclude={(LISTS_DIR / "list-exclude-user.txt").as_posix()}',
+        f'--ipset-exclude={(LISTS_DIR / "ipset-exclude.txt").as_posix()}',
+        f'--ipset-exclude={(LISTS_DIR / "ipset-exclude-user.txt").as_posix()}',
+        f'--dpi-desync-fake-tls={(BIN_DIR / "stun.bin").as_posix()}',
+        f'--dpi-desync-fake-tls={(BIN_DIR / "tls_clienthello_www_google_com.bin").as_posix()}',
+        f'--dpi-desync-fake-http={(BIN_DIR / "tls_clienthello_max_ru.bin").as_posix()}',
         *strat_parts,
         "--new",
     ]
@@ -752,6 +808,7 @@ def get_winws_args(strategy_str: str, config: dict, log_cb: Optional[Callable[[s
 
 def start_bypass_background(log_cb: Optional[Callable[[str], None]] = None) -> tuple[bool, str]:
     # Запуск без PIPE, при стартовом сбое чистим драйвер/правила и повторяем
+    ensure_files_exist()
     cfg = load_config()
     strat = cfg.get("strategy", "") or STRATEGIES[2]["args"]
     engine_bin = get_engine_binary()
@@ -759,7 +816,6 @@ def start_bypass_background(log_cb: Optional[Callable[[str], None]] = None) -> t
     if not engine_bin.exists():
         return False, f"{engine_name} не найден в {BIN_DIR}"
 
-    ensure_files_exist()
     kill_winws()
     udp_ports, _ = resolve_udp_ports(cfg.get("udp_mode", "narrow"))
     if IS_LINUX:
@@ -897,19 +953,20 @@ def check_sites_parallel(timeout: int = 4) -> dict[str, tuple[bool, str]]:
 
 
 def get_self_launch_spec() -> tuple[str, str, str]:
-    argv0 = Path(sys.argv[0]).resolve() if sys.argv else Path(sys.executable).resolve()
+    if is_compiled_binary():
+        exe_path = get_real_executable()
+        return str(exe_path), "--background", str(exe_path.parent)
+    script_path = (
+        Path(sys.argv[0]).resolve()
+        if (sys.argv and sys.argv[0] and Path(sys.argv[0]).exists())
+        else (Path(__file__).resolve().parent / "zapret_manager.py").resolve()
+    )
+    py_exe = Path(sys.executable).resolve()
     if IS_WINDOWS:
-        if argv0.suffix.lower() == ".exe":
-            return str(argv0), "--background", str(argv0.parent)
-        py_exe = Path(sys.executable).resolve()
         pyw_exe = py_exe.with_name("pythonw.exe")
         chosen_py = str(pyw_exe if pyw_exe.exists() else py_exe)
-        return chosen_py, f'"{argv0}" --background', str(argv0.parent)
-
-    is_compiled = ("__compiled__" in globals()) or getattr(sys, "frozen", False)
-    if is_compiled:
-        return str(argv0), "--background", str(argv0.parent)
-    return str(Path(sys.executable).resolve()), f'"{argv0}" --background', str(argv0.parent)
+        return chosen_py, f'"{script_path}" --background', str(script_path.parent)
+    return str(py_exe), f'"{script_path}" --background', str(script_path.parent)
 
 
 def _normalize_path_str(p: str) -> str:
@@ -941,8 +998,8 @@ def get_autorun_info() -> dict:
                 enabled = res.returncode == 0 and res.stdout.strip() in ("enabled", "static")
             except Exception:
                 pass
-        expected_full = f'"{expected_cmd}" {expected_args}'.strip()
-        path_matches = enabled and (expected_cmd in exec_line) and ("--background" in exec_line)
+        expected_full = f"{expected_cmd} {expected_args}".strip()
+        path_matches = enabled and (expected_cmd in exec_line) and (expected_args in exec_line)
         return {
             "enabled": enabled,
             "path_matches": path_matches,
@@ -1076,6 +1133,7 @@ def enable_autorun() -> tuple[bool, str]:
     if not IS_WINDOWS:
         if not shutil.which("systemctl"):
             return False, "systemd (systemctl) не найден в системе"
+        stop_args = args.replace("--background", "--stop") if "--background" in args else f"{args} --stop".strip()
         unit_content = (
             "[Unit]\n"
             "Description=Unfit Zapret DPI Bypass\n"
@@ -1086,7 +1144,7 @@ def enable_autorun() -> tuple[bool, str]:
             "RemainAfterExit=yes\n"
             f"WorkingDirectory={wd}\n"
             f"ExecStart={cmd} {args}\n"
-            f"ExecStop={shutil.which('pkill') or '/usr/bin/pkill'} -f nfqws\n\n"
+            f"ExecStop={cmd} {stop_args}\n\n"
             "[Install]\n"
             "WantedBy=multi-user.target\n"
         )
@@ -1489,13 +1547,10 @@ def download_and_apply_update(asset_url: str) -> tuple[bool, str]:
     if not asset_url or not asset_url.lower().endswith(".exe"):
         return False, "В релизе нет подходящего .exe файла"
 
-    is_compiled = ("__compiled__" in globals()) or bool(
-        sys.argv and sys.argv[0] and Path(sys.argv[0]).suffix.lower() == ".exe"
-    )
-    if not is_compiled:
+    if not is_compiled_binary():
         return False, "Автообновление доступно только в скомпилированном .exe"
 
-    target_exe = Path(sys.argv[0]).resolve()
+    target_exe = get_real_executable()
     new_exe = target_exe.with_suffix(".exe.new")
 
     try:

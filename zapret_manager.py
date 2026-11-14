@@ -14,6 +14,14 @@ if "--background" in sys.argv[1:]:
         sys.exit(0)
     sys.exit(zapret_core.run_autorun_background())
 
+if "--stop" in sys.argv[1:]:
+    import zapret_core
+    if zapret_core.IS_LINUX and not zapret_core.is_admin():
+        zapret_core.relaunch_as_admin()
+        sys.exit(0)
+    zapret_core.kill_winws()
+    sys.exit(0)
+
 import subprocess
 import threading
 import time
@@ -304,6 +312,7 @@ class DemonAuraWidget(QWidget):
 
         self._anim_timer = QTimer(self)
         self._anim_timer.timeout.connect(self._tick)
+        self._anim_timer.start(36)
 
     def set_active_mode(self, active: bool):
         if self._active_mode != active:
@@ -435,6 +444,9 @@ class SimpleWorker(QObject):
 
 
 class AutoTuneWorker(QObject):
+    step_started = pyqtSignal(int, int, str)
+    step_result = pyqtSignal(int, bool, bool, str)
+    finished_all = pyqtSignal(list, bool)
     log_msg = pyqtSignal(str)
 
     def __init__(self):
@@ -454,121 +466,129 @@ class AutoTuneWorker(QObject):
 
     def _run(self):
         results = []
-        core.kill_winws()
-        core.ensure_files_exist()
+        aborted_by_error = False
+        try:
+            core.ensure_files_exist()
+            core.kill_winws()
 
-        engine_bin = core.get_engine_binary()
-        engine_name = engine_bin.name
-        if not engine_bin.exists():
-            self.log_msg.emit(f"[ОШИБКА] {engine_name} не найден в {core.BIN_DIR}")
-            self.finished_all.emit(results, True)
-            return
-
-        if core.IS_LINUX:
-            fw_ok, fw_err = core.setup_linux_firewall("443,19294-19344,50000-50100")
-            if not fw_ok:
-                self.log_msg.emit(f"[ОШИБКА] {fw_err}")
-                self.finished_all.emit(results, True)
+            engine_bin = core.get_engine_binary()
+            engine_name = engine_bin.name
+            if not engine_bin.exists():
+                self.log_msg.emit(f"[ОШИБКА] {engine_name} не найден в {core.BIN_DIR}")
+                aborted_by_error = True
                 return
 
-        test_cfg = {"fake_sni": "www.google.com", "udp_mode": "narrow"}
-        total = len(core.STRATEGIES)
+            if core.IS_LINUX:
+                fw_ok, fw_err = core.setup_linux_firewall("443,19294-19344,50000-50100")
+                if not fw_ok:
+                    self.log_msg.emit(f"[ОШИБКА] {fw_err}")
+                    aborted_by_error = True
+                    return
 
-        for idx, item in enumerate(core.STRATEGIES, 1):
-            if self._stop_requested:
-                break
+            test_cfg = {"fake_sni": "www.google.com", "udp_mode": "narrow"}
+            total = len(core.STRATEGIES)
 
-            strat = item["args"]
-            self.step_started.emit(idx, total, item["name"])
-            self.log_msg.emit(f"[Тюнер {idx}/{total}] Тестируем: {item['name']}...")
-
-            cmd = core.get_winws_args(strat, test_cfg)
-            popen_kw = (
-                {"creationflags": core.CREATE_NO_WINDOW}
-                if core.IS_WINDOWS
-                else {"start_new_session": True}
-            )
-            proc = None
-            try:
-                proc = subprocess.Popen(
-                    cmd,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
-                    cwd=str(core.BIN_DIR),
-                    **popen_kw,
-                )
-            except Exception as e:
-                self.log_msg.emit(f"  [Ошибка запуска] {e}")
-                results.append({"index": idx, "strategy": strat, "yt": False, "ds": False, "note": "Ошибка запуска"})
-                self.step_result.emit(idx, False, False, "Ошибка запуска")
-                continue
-
-            aborted = False
-            for _ in range(11):
+            for idx, item in enumerate(core.STRATEGIES, 1):
                 if self._stop_requested:
-                    aborted = True
                     break
-                if proc.poll() is not None:
-                    break
-                time.sleep(0.2)
 
-            if aborted:
+                strat = item["args"]
+                self.step_started.emit(idx, total, item["name"])
+                self.log_msg.emit(f"[Тюнер {idx}/{total}] Тестируем: {item['name']}...")
+
+                cmd = core.get_winws_args(strat, test_cfg)
+                popen_kw = (
+                    {"creationflags": core.CREATE_NO_WINDOW}
+                    if core.IS_WINDOWS
+                    else {"start_new_session": True}
+                )
+                proc = None
+                try:
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                        cwd=str(core.BIN_DIR),
+                        **popen_kw,
+                    )
+                except Exception as e:
+                    self.log_msg.emit(f"  [Ошибка запуска] {e}")
+                    results.append({"index": idx, "strategy": strat, "yt": False, "ds": False, "note": "Ошибка запуска"})
+                    self.step_result.emit(idx, False, False, "Ошибка запуска")
+                    continue
+
+                aborted = False
+                for _ in range(11):
+                    if self._stop_requested:
+                        aborted = True
+                        break
+                    if proc.poll() is not None:
+                        break
+                    time.sleep(0.2)
+
+                if aborted:
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=2)
+                    except Exception:
+                        pass
+                    core.kill_winws()
+                    break
+
+                if proc.poll() is not None:
+                    err_txt = ""
+                    try:
+                        if proc.stderr:
+                            err_txt = proc.stderr.read().decode("utf-8", errors="ignore").strip()
+                    except Exception:
+                        pass
+                    note = "Упал"
+                    self.log_msg.emit(f"  [{engine_name} упал] {err_txt[:100] if err_txt else 'без текста ошибки'}")
+                    results.append({"index": idx, "strategy": strat, "yt": False, "ds": False, "note": note})
+                    self.step_result.emit(idx, False, False, note)
+                    core.cleanup_windivert()
+                    if core.IS_LINUX:
+                        core.setup_linux_firewall("443,19294-19344,50000-50100")
+                    time.sleep(0.3)
+                    continue
+
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    f_yt = pool.submit(core.check_url, "https://www.youtube.com", 4)
+                    f_ds = pool.submit(core.check_url, "https://discord.com/api/v10/gateway", 4)
+                    yt_ok, yt_code = f_yt.result()
+                    ds_ok, ds_code = f_ds.result()
+
                 try:
                     proc.kill()
                     proc.wait(timeout=2)
                 except Exception:
                     pass
-                core.kill_winws()
-                break
-
-            if proc.poll() is not None:
-                err_txt = ""
-                try:
-                    if proc.stderr:
-                        err_txt = proc.stderr.read().decode("utf-8", errors="ignore").strip()
-                except Exception:
-                    pass
-                note = "Упал"
-                self.log_msg.emit(f"  [{engine_name} упал] {err_txt[:100] if err_txt else 'без текста ошибки'}")
-                results.append({"index": idx, "strategy": strat, "yt": False, "ds": False, "note": note})
-                self.step_result.emit(idx, False, False, note)
-                core.cleanup_windivert()
-                if core.IS_LINUX:
+                core.kill_winws(timeout=1.5)
+                if core.IS_LINUX and idx < total and not self._stop_requested:
                     core.setup_linux_firewall("443,19294-19344,50000-50100")
-                time.sleep(0.3)
-                continue
 
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                f_yt = pool.submit(core.check_url, "https://www.youtube.com", 4)
-                f_ds = pool.submit(core.check_url, "https://discord.com/api/v10/gateway", 4)
-                yt_ok, yt_code = f_yt.result()
-                ds_ok, ds_code = f_ds.result()
+                if yt_ok and ds_ok:
+                    note = "Отлично"
+                elif yt_ok or ds_ok:
+                    note = "Частично"
+                else:
+                    note = "Не пробило"
 
+                self.log_msg.emit(
+                    f"  -> YouTube: {'OK' if yt_ok else 'FAIL'} ({yt_code}) | Discord: {'OK' if ds_ok else 'FAIL'} ({ds_code})"
+                )
+                results.append({"index": idx, "strategy": strat, "yt": yt_ok, "ds": ds_ok, "note": note})
+                self.step_result.emit(idx, yt_ok, ds_ok, note)
+        except Exception as e:
+            aborted_by_error = True
+            self.log_msg.emit(f"[ОШИБКА] Сбой авто-тюнинга: {e}")
+        finally:
             try:
-                proc.kill()
-                proc.wait(timeout=2)
+                core.kill_winws(timeout=1.5)
             except Exception:
                 pass
-            core.kill_winws(timeout=1.5)
-            if core.IS_LINUX and idx < total and not self._stop_requested:
-                core.setup_linux_firewall("443,19294-19344,50000-50100")
-
-            if yt_ok and ds_ok:
-                note = "Отлично"
-            elif yt_ok or ds_ok:
-                note = "Частично"
-            else:
-                note = "Не пробило"
-
-            self.log_msg.emit(
-                f"  -> YouTube: {'OK' if yt_ok else 'FAIL'} ({yt_code}) | Discord: {'OK' if ds_ok else 'FAIL'} ({ds_code})"
-            )
-            results.append({"index": idx, "strategy": strat, "yt": yt_ok, "ds": ds_ok, "note": note})
-            self.step_result.emit(idx, yt_ok, ds_ok, note)
-
-        core.kill_winws(timeout=1.5)
-        self.finished_all.emit(results, self._stop_requested)
+            self.finished_all.emit(results, self._stop_requested or aborted_by_error)
 
 
 APP_STYLESHEET = """
@@ -883,12 +903,12 @@ class MainWindow(QMainWindow):
         self.icon_active = create_demon_crest_icon(active=True, size=96)
         self.setWindowIcon(self.icon_idle)
 
+        core.ensure_files_exist()
         self._build_ui()
         self._apply_theme_cursors(self)
         self._setup_tray()
         self._setup_timers()
 
-        core.ensure_files_exist()
         self.append_log(f"Unfit Zapret v{core.APP_VERSION} запущен. Рабочая папка: {core.WORK_DIR}")
         self.refresh_all_state()
         self._auto_repair_autorun_if_needed()
@@ -1719,7 +1739,7 @@ class MainWindow(QMainWindow):
                 self.lbl_update_status.setText(f"Версия v{core.APP_VERSION} ({info.get('error', 'офлайн')})")
 
     def _on_open_update_release(self):
-        if core.IS_WINDOWS and self._latest_asset_url.lower().endswith(".exe") and Path(sys.argv[0]).suffix.lower() == ".exe":
+        if core.IS_WINDOWS and self._latest_asset_url.lower().endswith(".exe") and core.is_compiled_binary():
             self.btn_sb_update.setEnabled(False)
             self.btn_open_release.setEnabled(False)
             self.btn_open_release.setText("Скачивание...")
