@@ -1,0 +1,6 @@
+{
+    "strategy": "--dpi-desync=fake,multisplit --dpi-desync-split-seqovl=681 --dpi-desync-split-pos=1 --dpi-desync-fooling=ts --dpi-desync-repeats=8 --dpi-desync-fake-tls-mod=rnd,dupsid,sni={fake_sni}",
+    "index": 3,
+    "udp_mode": "narrow",
+    "fake_sni": "www.google.com"
+}

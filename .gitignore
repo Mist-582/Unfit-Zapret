@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.build/
+*.dist/
+*.onefile-build/
+embedded_assets.zip
+.assets_version
+autorun.log
+*.log
+/*.exe
+*.exe.new
+.gemini/
+.agents/
+.sixth/
