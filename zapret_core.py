@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import ctypes
-from ctypes import wintypes
 import ipaddress
 import json
 import os
+import platform
 import random
 import re
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -21,19 +23,56 @@ from pathlib import Path
 from typing import Callable, Optional
 from xml.sax.saxutils import escape as xml_escape
 
+IS_WINDOWS = sys.platform == "win32"
+IS_LINUX = sys.platform.startswith("linux")
 
-CREATE_NO_WINDOW = 0x08000000
-DETACHED_PROCESS = 0x00000008
-CREATE_NEW_PROCESS_GROUP = 0x00000200
-CREATE_BREAKAWAY_FROM_JOB = 0x01000000
-BACKGROUND_FLAGS = CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+if IS_WINDOWS:
+    from ctypes import wintypes
+    CREATE_NO_WINDOW = 0x08000000
+    DETACHED_PROCESS = 0x00000008
+    CREATE_NEW_PROCESS_GROUP = 0x00000200
+    CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+    BACKGROUND_FLAGS = CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+else:
+    CREATE_NO_WINDOW = 0
+    DETACHED_PROCESS = 0
+    CREATE_NEW_PROCESS_GROUP = 0
+    CREATE_BREAKAWAY_FROM_JOB = 0
+    BACKGROUND_FLAGS = 0
 
 TASK_NAME = "ZapretUltraStable"
+SYSTEMD_SERVICE = "unfit-zapret.service"
+LINUX_NFQ_NUM = 200
+LINUX_FWMARK = 0x40000000
+LINUX_NFT_TABLE = "unfit_zapret"
+
 APP_NAME = "Unfit Zapret"
 APP_VERSION = "2.0.0"
 GITHUB_OWNER = "Mist-582"
 GITHUB_REPO = "Unfit-Zapret"
 GITHUB_AVATAR_URL = f"https://avatars.githubusercontent.com/{GITHUB_OWNER}?s=128"
+
+
+def detect_arch() -> str:
+    m = platform.machine().lower()
+    if m in ("amd64", "x86_64", "x64"):
+        return "x86_64"
+    if m in ("i386", "i486", "i586", "i686", "x86"):
+        return "x86"
+    if m in ("aarch64", "arm64", "armv8b", "armv8l"):
+        return "arm64"
+    if m.startswith("arm"):
+        return "arm"
+    return "x86_64"
+
+
+def get_platform_label() -> str:
+    os_name = "Windows" if IS_WINDOWS else ("Linux" if IS_LINUX else sys.platform)
+    return f"{os_name} {detect_arch()}"
+
+
+def _subproc_hidden_kwargs() -> dict:
+    return {"creationflags": CREATE_NO_WINDOW} if IS_WINDOWS else {}
 
 
 def get_embedded_assets_zip() -> Optional[Path]:
@@ -53,14 +92,21 @@ def get_embedded_assets_zip() -> Optional[Path]:
 
 
 def get_work_dir() -> Path:
-    # Единая рабочая папка для админа и службы SYSTEM
-    is_compiled = ("__compiled__" in globals()) or bool(
-        sys.argv and sys.argv[0] and Path(sys.argv[0]).suffix.lower() == ".exe"
-    )
-    if is_compiled or get_embedded_assets_zip() is not None and not (Path(__file__).resolve().parent / "bin" / "winws.exe").exists():
-        prog_data = Path(os.environ.get("ProgramData", r"C:\ProgramData"))
-        return prog_data / "UnfitZapret"
+    if IS_WINDOWS:
+        # ProgramData общая для админа и службы SYSTEM
+        is_compiled = ("__compiled__" in globals()) or bool(
+            sys.argv and sys.argv[0] and Path(sys.argv[0]).suffix.lower() == ".exe"
+        )
+        if is_compiled or (get_embedded_assets_zip() is not None and not (Path(__file__).resolve().parent / "bin" / "winws.exe").exists()):
+            prog_data = Path(os.environ.get("ProgramData", r"C:\ProgramData"))
+            return prog_data / "UnfitZapret"
+        return Path(__file__).resolve().parent
 
+    is_compiled = ("__compiled__" in globals()) or getattr(sys, "frozen", False)
+    if is_compiled:
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            return Path("/opt/unfit-zapret")
+        return Path.home() / ".local" / "share" / "unfit-zapret"
     return Path(__file__).resolve().parent
 
 
@@ -69,7 +115,27 @@ BIN_DIR = WORK_DIR / "bin"
 LISTS_DIR = WORK_DIR / "lists"
 CONFIG_FILE = WORK_DIR / "zapret_config.json"
 AUTORUN_LOG_FILE = WORK_DIR / "autorun.log"
-CURL_EXE = r"C:\Windows\System32\curl.exe" if os.path.exists(r"C:\Windows\System32\curl.exe") else "curl"
+if IS_WINDOWS:
+    CURL_EXE = r"C:\Windows\System32\curl.exe" if os.path.exists(r"C:\Windows\System32\curl.exe") else "curl"
+else:
+    CURL_EXE = shutil.which("curl") or "curl"
+
+
+def get_engine_binary() -> Path:
+    if IS_WINDOWS:
+        return BIN_DIR / "winws.exe"
+    arch_bin = BIN_DIR / f"nfqws-linux-{detect_arch()}"
+    if arch_bin.exists():
+        return arch_bin
+    plain = BIN_DIR / "nfqws"
+    if plain.exists():
+        return plain
+    sys_bin = shutil.which("nfqws")
+    return Path(sys_bin) if sys_bin else arch_bin
+
+
+def get_engine_name() -> str:
+    return "winws.exe" if IS_WINDOWS else get_engine_binary().name
 
 
 STRATEGIES: list[dict[str, str]] = [
@@ -178,105 +244,249 @@ GAME_KEYWORDS = (
 
 
 def is_admin() -> bool:
-    try:
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
-    except Exception:
-        return False
+    if IS_WINDOWS:
+        try:
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return False
+    return hasattr(os, "geteuid") and os.geteuid() == 0
 
 
 def relaunch_as_admin() -> None:
-    argv0 = Path(sys.argv[0]).resolve() if sys.argv else None
-    is_compiled = argv0 is not None and argv0.suffix.lower() == ".exe"
-    if is_compiled:
-        extra_args = " ".join(f'"{a}"' for a in sys.argv[1:]) if len(sys.argv) > 1 else None
-        ctypes.windll.shell32.ShellExecuteW(None, "runas", str(argv0), extra_args, str(argv0.parent), 1)
-    else:
-        script_path = os.path.abspath(sys.argv[0])
-        py_exe = sys.executable
-        pyw = Path(py_exe).with_name("pythonw.exe")
-        if pyw.exists() and "--console" not in sys.argv:
-            py_exe = str(pyw)
-        args = f'"{script_path}"'
-        if len(sys.argv) > 1:
-            args += " " + " ".join(f'"{a}"' for a in sys.argv[1:])
-        ctypes.windll.shell32.ShellExecuteW(None, "runas", py_exe, args, str(Path(script_path).parent), 1)
+    if IS_WINDOWS:
+        argv0 = Path(sys.argv[0]).resolve() if sys.argv else None
+        is_compiled = argv0 is not None and argv0.suffix.lower() == ".exe"
+        if is_compiled:
+            extra_args = " ".join(f'"{a}"' for a in sys.argv[1:]) if len(sys.argv) > 1 else None
+            ctypes.windll.shell32.ShellExecuteW(None, "runas", str(argv0), extra_args, str(argv0.parent), 1)
+        else:
+            script_path = os.path.abspath(sys.argv[0])
+            py_exe = sys.executable
+            pyw = Path(py_exe).with_name("pythonw.exe")
+            if pyw.exists() and "--console" not in sys.argv:
+                py_exe = str(pyw)
+            args = f'"{script_path}"'
+            if len(sys.argv) > 1:
+                args += " " + " ".join(f'"{a}"' for a in sys.argv[1:])
+            ctypes.windll.shell32.ShellExecuteW(None, "runas", py_exe, args, str(Path(script_path).parent), 1)
+        return
+
+    argv0 = Path(sys.argv[0]).resolve() if sys.argv else Path(sys.executable).resolve()
+    is_compiled = ("__compiled__" in globals()) or getattr(sys, "frozen", False)
+    target_cmd = [str(argv0), *sys.argv[1:]] if is_compiled else [sys.executable, os.path.abspath(sys.argv[0]), *sys.argv[1:]]
+    if shutil.which("pkexec") and (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        env_args = []
+        for k in ("DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR", "QT_QPA_PLATFORM"):
+            v = os.environ.get(k)
+            if v:
+                env_args.append(f"{k}={v}")
+        cmd = ["pkexec", "env", *env_args, *target_cmd] if env_args else ["pkexec", *target_cmd]
+        subprocess.Popen(cmd, start_new_session=True)
+    elif shutil.which("sudo"):
+        subprocess.Popen(["sudo", "-E", *target_cmd], start_new_session=True)
 
 
-_TH32CS_SNAPPROCESS = 0x00000002
-_INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
+if IS_WINDOWS:
+    _TH32CS_SNAPPROCESS = 0x00000002
+    _INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
 
+    class _PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
 
-class _PROCESSENTRY32W(ctypes.Structure):
-    _fields_ = [
-        ("dwSize", wintypes.DWORD),
-        ("cntUsage", wintypes.DWORD),
-        ("th32ProcessID", wintypes.DWORD),
-        ("th32DefaultHeapID", ctypes.c_size_t),
-        ("th32ModuleID", wintypes.DWORD),
-        ("cntThreads", wintypes.DWORD),
-        ("th32ParentProcessID", wintypes.DWORD),
-        ("pcPriClassBase", ctypes.c_long),
-        ("dwFlags", wintypes.DWORD),
-        ("szExeFile", wintypes.WCHAR * 260),
-    ]
-
-
-_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-_kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
-_kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
-_kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
-_kernel32.Process32FirstW.restype = wintypes.BOOL
-_kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
-_kernel32.Process32NextW.restype = wintypes.BOOL
-_kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-_kernel32.CloseHandle.restype = wintypes.BOOL
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    _kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    _kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+    _kernel32.Process32FirstW.restype = wintypes.BOOL
+    _kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+    _kernel32.Process32NextW.restype = wintypes.BOOL
+    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _kernel32.CloseHandle.restype = wintypes.BOOL
+else:
+    _kernel32 = None
 
 
 def iter_processes() -> dict[int, str]:
     pids: dict[int, str] = {}
-    snap = _kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
-    if snap == _INVALID_HANDLE_VALUE or snap is None:
+    if IS_WINDOWS:
+        snap = _kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
+        if snap == _INVALID_HANDLE_VALUE or snap is None:
+            return pids
+        try:
+            entry = _PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+            if _kernel32.Process32FirstW(snap, ctypes.byref(entry)):
+                while True:
+                    pids[int(entry.th32ProcessID)] = entry.szExeFile.lower()
+                    if not _kernel32.Process32NextW(snap, ctypes.byref(entry)):
+                        break
+        finally:
+            _kernel32.CloseHandle(snap)
         return pids
-    try:
-        entry = _PROCESSENTRY32W()
-        entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
-        if _kernel32.Process32FirstW(snap, ctypes.byref(entry)):
-            while True:
-                pids[int(entry.th32ProcessID)] = entry.szExeFile.lower()
-                if not _kernel32.Process32NextW(snap, ctypes.byref(entry)):
-                    break
-    finally:
-        _kernel32.CloseHandle(snap)
+
+    proc_dir = Path("/proc")
+    if not proc_dir.is_dir():
+        return pids
+    for entry in proc_dir.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            raw_cmd = (entry / "cmdline").read_bytes()
+            if raw_cmd:
+                exe = Path(raw_cmd.split(b"\x00", 1)[0].decode("utf-8", errors="ignore")).name.lower()
+                if exe:
+                    pids[pid] = exe
+                    continue
+            comm = (entry / "comm").read_text(encoding="utf-8", errors="ignore").strip().lower()
+            if comm:
+                pids[pid] = comm
+        except OSError:
+            continue
     return pids
+
+
+def _is_engine_proc_name(name: str) -> bool:
+    if IS_WINDOWS:
+        return name == "winws.exe"
+    return name == "nfqws" or name.startswith("nfqws-linux-")
 
 
 def is_winws_running() -> bool:
     try:
-        return "winws.exe" in iter_processes().values()
+        return any(_is_engine_proc_name(n) for n in iter_processes().values())
     except Exception:
         return False
 
 
 def get_winws_pids() -> list[int]:
     try:
-        return [pid for pid, name in iter_processes().items() if name == "winws.exe"]
+        return [pid for pid, name in iter_processes().items() if _is_engine_proc_name(name)]
     except Exception:
         return []
 
 
-def kill_winws(timeout: float = 3.0) -> bool:
-    if not is_winws_running():
-        return True
-    try:
-        subprocess.run(
-            ["taskkill", "/f", "/im", "winws.exe"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=CREATE_NO_WINDOW,
-            timeout=5,
+def cleanup_linux_firewall() -> None:
+    if not IS_LINUX:
+        return
+    if shutil.which("nft"):
+        try:
+            subprocess.run(["nft", "delete", "table", "inet", LINUX_NFT_TABLE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        except Exception:
+            pass
+    for ipt in ("iptables", "ip6tables"):
+        if not shutil.which(ipt):
+            continue
+        for proto, dports in (("tcp", "80,443,2053,2083,2087,2096,8443"), ("udp", "443,19294:19344,50000:50100"), ("udp", "443,19294:19344,50000:65535"), ("udp", "443,19294:19344,12")):
+            for _ in range(3):
+                try:
+                    res = subprocess.run(
+                        [
+                            ipt, "-t", "mangle", "-D", "POSTROUTING",
+                            "-p", proto, "-m", "multiport", "--dports", dports,
+                            "-m", "mark", "!", "--mark", f"{LINUX_FWMARK:#x}/{LINUX_FWMARK:#x}",
+                            "-j", "NFQUEUE", "--queue-num", str(LINUX_NFQ_NUM), "--queue-bypass",
+                        ],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=3,
+                    )
+                    if res.returncode != 0:
+                        break
+                except Exception:
+                    break
+
+
+def setup_linux_firewall(udp_ports: str) -> tuple[bool, str]:
+    if not IS_LINUX:
+        return True, ""
+    cleanup_linux_firewall()
+
+    nft_udp = udp_ports.replace(",", ", ")
+    if shutil.which("nft"):
+        script = (
+            f"add table inet {LINUX_NFT_TABLE}\n"
+            f"add chain inet {LINUX_NFT_TABLE} postrouting {{ type filter hook postrouting priority mangle; policy accept; }}\n"
+            f"add rule inet {LINUX_NFT_TABLE} postrouting meta mark & {LINUX_FWMARK:#x} != 0 return\n"
+            f"add rule inet {LINUX_NFT_TABLE} postrouting tcp dport {{ 80, 443, 2053, 2083, 2087, 2096, 8443 }} queue num {LINUX_NFQ_NUM} bypass\n"
+            f"add rule inet {LINUX_NFT_TABLE} postrouting udp dport {{ {nft_udp} }} queue num {LINUX_NFQ_NUM} bypass\n"
         )
-    except Exception:
-        pass
+        try:
+            res = subprocess.run(["nft", "-f", "-"], input=script, text=True, capture_output=True, timeout=5)
+            if res.returncode == 0:
+                return True, "nftables"
+        except Exception:
+            pass
+
+    ipt_udp = udp_ports.replace("-", ":")
+    ok_any = False
+    last_err = ""
+    for ipt in ("iptables", "ip6tables"):
+        if not shutil.which(ipt):
+            continue
+        ok_family = True
+        for proto, dports in (("tcp", "80,443,2053,2083,2087,2096,8443"), ("udp", ipt_udp)):
+            res = subprocess.run(
+                [
+                    ipt, "-t", "mangle", "-I", "POSTROUTING",
+                    "-p", proto, "-m", "multiport", "--dports", dports,
+                    "-m", "mark", "!", "--mark", f"{LINUX_FWMARK:#x}/{LINUX_FWMARK:#x}",
+                    "-j", "NFQUEUE", "--queue-num", str(LINUX_NFQ_NUM), "--queue-bypass",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if res.returncode != 0:
+                ok_family = False
+                last_err = (res.stderr or res.stdout or "").strip()
+        if ipt == "iptables" and ok_family:
+            ok_any = True
+
+    if ok_any:
+        return True, "iptables"
+    return False, last_err or "Не найден nftables (nft) или iptables для перехвата NFQUEUE"
+
+
+def kill_winws(timeout: float = 3.0) -> bool:
+    if IS_WINDOWS:
+        if not is_winws_running():
+            return True
+        try:
+            subprocess.run(
+                ["taskkill", "/f", "/im", "winws.exe"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=CREATE_NO_WINDOW,
+                timeout=5,
+            )
+        except Exception:
+            pass
+    else:
+        for pid in get_winws_pids():
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+        if is_winws_running():
+            time.sleep(0.3)
+            for pid in get_winws_pids():
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+        cleanup_linux_firewall()
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -287,6 +497,9 @@ def kill_winws(timeout: float = 3.0) -> bool:
 
 
 def cleanup_windivert() -> None:
+    if not IS_WINDOWS:
+        cleanup_linux_firewall()
+        return
     for svc in ("WinDivert", "WinDivert14"):
         try:
             subprocess.run(
@@ -365,10 +578,16 @@ def ensure_files_exist() -> None:
                         fname = rel[4:]
                         if not fname or "/" in fname or fname == "]":
                             continue
+                        if IS_WINDOWS and fname.startswith("nfqws"):
+                            continue
+                        if IS_LINUX and fname.lower().endswith((".exe", ".dll", ".sys")):
+                            continue
                         dst = BIN_DIR / fname
                         if not dst.exists() or (need_update and not winws_busy):
                             try:
                                 dst.write_bytes(zf.read(member))
+                                if IS_LINUX and fname.startswith("nfqws"):
+                                    os.chmod(dst, 0o755)
                             except OSError:
                                 pass
                     elif rel.startswith("lists/"):
@@ -390,11 +609,28 @@ def ensure_files_exist() -> None:
         except Exception:
             pass
 
+    if IS_LINUX and BIN_DIR.exists():
+        # На Linux даём права на запуск бинарникам nfqws
+        for p in BIN_DIR.iterdir():
+            if p.is_file() and p.name.startswith("nfqws"):
+                try:
+                    os.chmod(p, 0o755)
+                except OSError:
+                    pass
+
     for filename in REQUIRED_LIST_FILES:
         file_path = LISTS_DIR / filename
         if not file_path.exists():
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(f"# Автоматически созданный файл: {filename}\n")
+
+
+def resolve_udp_ports(udp_mode: str) -> tuple[str, str]:
+    if udp_mode == "wide":
+        return "443,19294-19344,50000-65535", "19294-19344,50000-65535"
+    if udp_mode == "narrow":
+        return "443,19294-19344,50000-50100", "19294-19344,50000-50100"
+    return "443,19294-19344,12", "19294-19344,12"
 
 
 def get_winws_args(strategy_str: str, config: dict, log_cb: Optional[Callable[[str], None]] = None) -> list[str]:
@@ -410,17 +646,7 @@ def get_winws_args(strategy_str: str, config: dict, log_cb: Optional[Callable[[s
         resolved_sni = fake_sni
 
     resolved_strategy = strategy_str.replace("{fake_sni}", resolved_sni)
-
-    if udp_mode == "wide":
-        udp_ports = "443,19294-19344,50000-65535"
-        udp_voice_filter = "19294-19344,50000-65535"
-    elif udp_mode == "narrow":
-        udp_ports = "443,19294-19344,50000-50100"
-        udp_voice_filter = "19294-19344,50000-50100"
-    else:
-        udp_ports = "443,19294-19344,12"
-        udp_voice_filter = "19294-19344,12"
-
+    udp_ports, udp_voice_filter = resolve_udp_ports(udp_mode)
     strat_parts = resolved_strategy.split()
 
     if "--dpi-desync-split-seqovl=681" in resolved_strategy and not any(
@@ -432,10 +658,24 @@ def get_winws_args(strategy_str: str, config: dict, log_cb: Optional[Callable[[s
     ):
         strat_parts.append(f'--dpi-desync-split-seqovl-pattern={BIN_DIR / "tls_clienthello_max_ru.bin"}')
 
+    engine_bin = str(get_engine_binary())
+    if IS_WINDOWS:
+        prefix = [
+            engine_bin,
+            "--wf-tcp=80,443,2053,2083,2087,2096,8443",
+            f"--wf-udp={udp_ports}",
+        ]
+    else:
+        # Fwmark чтобы nfqws не зацикливал собственные пакеты в очереди
+        prefix = [
+            engine_bin,
+            f"--qnum={LINUX_NFQ_NUM}",
+            f"--dpi-desync-fwmark={LINUX_FWMARK}",
+            "--uid=0:0",
+        ]
+
     args = [
-        str(BIN_DIR / "winws.exe"),
-        "--wf-tcp=80,443,2053,2083,2087,2096,8443",
-        f"--wf-udp={udp_ports}",
+        *prefix,
         # UDP Discord Voice & STUN
         f"--filter-udp={udp_voice_filter}",
         "--filter-l7=discord,stun",
@@ -511,15 +751,22 @@ def get_winws_args(strategy_str: str, config: dict, log_cb: Optional[Callable[[s
 
 
 def start_bypass_background(log_cb: Optional[Callable[[str], None]] = None) -> tuple[bool, str]:
-    # Запуск без PIPE, при стартовом сбое чистим WinDivert и повторяем
+    # Запуск без PIPE, при стартовом сбое чистим драйвер/правила и повторяем
     cfg = load_config()
     strat = cfg.get("strategy", "") or STRATEGIES[2]["args"]
-    winws_exe = BIN_DIR / "winws.exe"
-    if not winws_exe.exists():
-        return False, f"winws.exe не найден в {BIN_DIR}"
+    engine_bin = get_engine_binary()
+    engine_name = engine_bin.name
+    if not engine_bin.exists():
+        return False, f"{engine_name} не найден в {BIN_DIR}"
 
     ensure_files_exist()
     kill_winws()
+    udp_ports, _ = resolve_udp_ports(cfg.get("udp_mode", "narrow"))
+    if IS_LINUX:
+        fw_ok, fw_info = setup_linux_firewall(udp_ports)
+        if not fw_ok:
+            return False, f"Ошибка настройки фаервола (нужен root и nft/iptables): {fw_info}"
+
     cmd = get_winws_args(strat, cfg, log_cb=log_cb)
 
     def _spawn(capture_err: bool = False) -> tuple[Optional[subprocess.Popen], str]:
@@ -530,14 +777,23 @@ def start_bypass_background(log_cb: Optional[Callable[[str], None]] = None) -> t
             cwd=str(BIN_DIR),
             close_fds=True,
         )
+        if not IS_WINDOWS:
+            try:
+                proc = subprocess.Popen(cmd, start_new_session=True, **kwargs)
+                return proc, ""
+            except PermissionError:
+                return None, "Требуются права root для запуска nfqws и NFQUEUE"
+            except Exception as e:
+                return None, f"Ошибка запуска {engine_name}: {e}"
+
         for flags in (BACKGROUND_FLAGS | CREATE_BREAKAWAY_FROM_JOB, BACKGROUND_FLAGS):
             try:
                 proc = subprocess.Popen(cmd, creationflags=flags, **kwargs)
                 return proc, ""
             except FileNotFoundError:
-                return None, f"winws.exe не найден в {BIN_DIR}"
+                return None, f"{engine_name} не найден в {BIN_DIR}"
             except PermissionError:
-        # Job object может запрещать breakaway
+                # Job object может запрещать breakaway
                 if flags != BACKGROUND_FLAGS:
                     continue
                 return None, "Требуются права Администратора для запуска WinDivert"
@@ -546,20 +802,26 @@ def start_bypass_background(log_cb: Optional[Callable[[str], None]] = None) -> t
                     continue
                 if "740" in str(e):
                     return None, "Требуются права Администратора для запуска WinDivert"
-                return None, f"Ошибка запуска winws.exe: {e}"
-        return None, "Не удалось запустить winws.exe"
+                return None, f"Ошибка запуска {engine_name}: {e}"
+        return None, f"Не удалось запустить {engine_name}"
 
     proc, err_msg = _spawn(capture_err=False)
     if proc is None:
+        if IS_LINUX:
+            cleanup_linux_firewall()
         return False, err_msg
 
     for _ in range(6):
         time.sleep(0.2)
         if proc.poll() is not None:
             cleanup_windivert()
+            if IS_LINUX:
+                setup_linux_firewall(udp_ports)
             time.sleep(0.5)
             diag_proc, diag_err = _spawn(capture_err=True)
             if diag_proc is None:
+                if IS_LINUX:
+                    cleanup_linux_firewall()
                 return False, diag_err
             time.sleep(1.0)
             if diag_proc.poll() is not None:
@@ -569,16 +831,24 @@ def start_bypass_background(log_cb: Optional[Callable[[str], None]] = None) -> t
                         err_out = diag_proc.stderr.read().decode("utf-8", errors="ignore").strip()
                 except Exception:
                     pass
-                return False, f"winws.exe завершился сразу после запуска{': ' + err_out[:200] if err_out else ''}"
-        # Повтор без PIPE, чтобы буфер не забился
+                if IS_LINUX:
+                    cleanup_linux_firewall()
+                return False, f"{engine_name} завершился сразу после запуска{': ' + err_out[:200] if err_out else ''}"
+            # Повтор без PIPE, чтобы буфер не забился
             kill_winws()
+            if IS_LINUX:
+                setup_linux_firewall(udp_ports)
             clean_proc, clean_err = _spawn(capture_err=False)
             if clean_proc is None:
+                if IS_LINUX:
+                    cleanup_linux_firewall()
                 return False, clean_err
             time.sleep(0.8)
             if clean_proc.poll() is not None:
-                return False, "winws.exe повторно завершился после запуска"
-            return True, "Обход успешно запущен (после сброса WinDivert)"
+                if IS_LINUX:
+                    cleanup_linux_firewall()
+                return False, f"{engine_name} повторно завершился после запуска"
+            return True, "Обход успешно запущен (после сброса фильтра)"
 
     return True, "Обход успешно запущен в фоне"
 
@@ -592,7 +862,7 @@ def check_url(url: str, timeout: int = 4) -> tuple[bool, str]:
                 "-4",
                 "-s",
                 "-o",
-                "nul",
+                os.devnull,
                 "-w",
                 "%{http_code}",
                 "--max-time",
@@ -603,8 +873,8 @@ def check_url(url: str, timeout: int = 4) -> tuple[bool, str]:
             ],
             capture_output=True,
             text=True,
-            creationflags=CREATE_NO_WINDOW,
             timeout=timeout + 2,
+            **_subproc_hidden_kwargs(),
         )
         code = res.stdout.strip()
         ok = code in {"200", "204", "301", "302", "307", "308", "403"}
@@ -628,21 +898,59 @@ def check_sites_parallel(timeout: int = 4) -> dict[str, tuple[bool, str]]:
 
 def get_self_launch_spec() -> tuple[str, str, str]:
     argv0 = Path(sys.argv[0]).resolve() if sys.argv else Path(sys.executable).resolve()
-    if argv0.suffix.lower() == ".exe":
-        return str(argv0), "--background", str(argv0.parent)
+    if IS_WINDOWS:
+        if argv0.suffix.lower() == ".exe":
+            return str(argv0), "--background", str(argv0.parent)
+        py_exe = Path(sys.executable).resolve()
+        pyw_exe = py_exe.with_name("pythonw.exe")
+        chosen_py = str(pyw_exe if pyw_exe.exists() else py_exe)
+        return chosen_py, f'"{argv0}" --background', str(argv0.parent)
 
-    py_exe = Path(sys.executable).resolve()
-    pyw_exe = py_exe.with_name("pythonw.exe")
-    chosen_py = str(pyw_exe if pyw_exe.exists() else py_exe)
-    return chosen_py, f'"{argv0}" --background', str(argv0.parent)
+    is_compiled = ("__compiled__" in globals()) or getattr(sys, "frozen", False)
+    if is_compiled:
+        return str(argv0), "--background", str(argv0.parent)
+    return str(Path(sys.executable).resolve()), f'"{argv0}" --background', str(argv0.parent)
 
 
 def _normalize_path_str(p: str) -> str:
     return os.path.normcase(os.path.normpath(p.strip().strip('"')))
 
 
+def _linux_unit_path() -> Path:
+    return Path(f"/etc/systemd/system/{SYSTEMD_SERVICE}")
+
+
 def get_autorun_info() -> dict:
     expected_cmd, expected_args, expected_wd = get_self_launch_spec()
+    if not IS_WINDOWS:
+        unit_file = _linux_unit_path()
+        if not unit_file.exists():
+            return {"enabled": False, "path_matches": False, "command": "", "error": ""}
+        exec_line = ""
+        try:
+            for line in unit_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+                if line.startswith("ExecStart="):
+                    exec_line = line.split("=", 1)[1].strip()
+                    break
+        except OSError:
+            pass
+        enabled = False
+        if shutil.which("systemctl"):
+            try:
+                res = subprocess.run(["systemctl", "is-enabled", SYSTEMD_SERVICE], capture_output=True, text=True, timeout=5)
+                enabled = res.returncode == 0 and res.stdout.strip() in ("enabled", "static")
+            except Exception:
+                pass
+        expected_full = f'"{expected_cmd}" {expected_args}'.strip()
+        path_matches = enabled and (expected_cmd in exec_line) and ("--background" in exec_line)
+        return {
+            "enabled": enabled,
+            "path_matches": path_matches,
+            "command": exec_line,
+            "expected": expected_full,
+            "error": "",
+        }
+
     try:
         res = subprocess.run(
             ["schtasks", "/query", "/tn", TASK_NAME, "/xml"],
@@ -728,7 +1036,6 @@ def _build_task_xml(command: str, arguments: str, working_dir: str) -> str:
     </Principal>
   </Principals>
   <Settings>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
     <AllowHardTerminate>false</AllowHardTerminate>
@@ -748,9 +1055,10 @@ def _build_task_xml(command: str, arguments: str, working_dir: str) -> str:
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
     <Priority>7</Priority>
     <RestartOnFailure>
-      <Interval>PT15S</Interval>
+      <Interval>PT1M</Interval>
       <Count>3</Count>
     </RestartOnFailure>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
   </Settings>
   <Actions Context="Author">
     <Exec>
@@ -765,6 +1073,35 @@ def _build_task_xml(command: str, arguments: str, working_dir: str) -> str:
 
 def enable_autorun() -> tuple[bool, str]:
     cmd, args, wd = get_self_launch_spec()
+    if not IS_WINDOWS:
+        if not shutil.which("systemctl"):
+            return False, "systemd (systemctl) не найден в системе"
+        unit_content = (
+            "[Unit]\n"
+            "Description=Unfit Zapret DPI Bypass\n"
+            "After=network-online.target\n"
+            "Wants=network-online.target\n\n"
+            "[Service]\n"
+            "Type=oneshot\n"
+            "RemainAfterExit=yes\n"
+            f"WorkingDirectory={wd}\n"
+            f"ExecStart={cmd} {args}\n"
+            f"ExecStop={shutil.which('pkill') or '/usr/bin/pkill'} -f nfqws\n\n"
+            "[Install]\n"
+            "WantedBy=multi-user.target\n"
+        )
+        try:
+            _linux_unit_path().write_text(unit_content, encoding="utf-8")
+            subprocess.run(["systemctl", "daemon-reload"], capture_output=True, timeout=10)
+            res = subprocess.run(["systemctl", "enable", SYSTEMD_SERVICE], capture_output=True, text=True, timeout=10)
+            if res.returncode == 0:
+                return True, f"Автозапуск включён ({SYSTEMD_SERVICE})"
+            return False, f"Ошибка systemctl enable: {(res.stderr or res.stdout).strip()}"
+        except PermissionError:
+            return False, "Нужны права root для настройки systemd-сервиса"
+        except Exception as e:
+            return False, f"Ошибка настройки systemd: {e}"
+
     xml_content = _build_task_xml(cmd, args, wd)
 
     old_bat = WORK_DIR / "autorun_helper.bat"
@@ -801,6 +1138,21 @@ def enable_autorun() -> tuple[bool, str]:
 
 
 def disable_autorun() -> tuple[bool, str]:
+    if not IS_WINDOWS:
+        try:
+            if shutil.which("systemctl"):
+                subprocess.run(["systemctl", "disable", SYSTEMD_SERVICE], capture_output=True, timeout=10)
+            unit_file = _linux_unit_path()
+            if unit_file.exists():
+                unit_file.unlink()
+            if shutil.which("systemctl"):
+                subprocess.run(["systemctl", "daemon-reload"], capture_output=True, timeout=10)
+            return True, "Автозапуск (systemd) отключён"
+        except PermissionError:
+            return False, "Нужны права root для отключения автозапуска"
+        except Exception as e:
+            return False, f"Ошибка отключения автозапуска: {e}"
+
     try:
         res = subprocess.run(
             ["schtasks", "/delete", "/tn", TASK_NAME, "/f"],
@@ -829,19 +1181,32 @@ def _write_autorun_log(message: str) -> None:
 
 
 def run_autorun_background() -> int:
-    # Мьютекс от параллельного запуска триггеров при старте
-    mutex = _kernel32.CreateMutexW(None, False, "Global\\ZapretUltraStableAutoStart")
-    last_err = ctypes.get_last_error()
-    if last_err == 183:  # ERROR_ALREADY_EXISTS
-        _write_autorun_log("Другой экземпляр --background уже запускает обход, выход.")
-        if mutex:
-            _kernel32.CloseHandle(mutex)
-        return 0
+    mutex = None
+    lock_fd = None
+    if IS_WINDOWS and _kernel32 is not None:
+        # Мьютекс от параллельного запуска триггеров при старте
+        mutex = _kernel32.CreateMutexW(None, False, "Global\\ZapretUltraStableAutoStart")
+        last_err = ctypes.get_last_error()
+        if last_err == 183:  # ERROR_ALREADY_EXISTS
+            _write_autorun_log("Другой экземпляр --background уже запускает обход, выход.")
+            if mutex:
+                _kernel32.CloseHandle(mutex)
+            return 0
+    elif IS_LINUX:
+        import fcntl
+        lock_path = Path(tempfile.gettempdir()) / "unfit-zapret-autostart.lock"
+        try:
+            lock_fd = open(lock_path, "w")
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            if lock_fd:
+                lock_fd.close()
+            return 0
 
     try:
         ensure_files_exist()
         if is_winws_running():
-            _write_autorun_log("winws.exe уже запущен, повторный запуск не требуется.")
+            _write_autorun_log(f"{get_engine_name()} уже запущен, повторный запуск не требуется.")
             return 0
 
         for attempt in range(1, 6):
@@ -858,8 +1223,69 @@ def run_autorun_background() -> int:
         _write_autorun_log(f"Исключение в --background: {type(e).__name__}: {e}")
         return 1
     finally:
-        if mutex:
+        if mutex and _kernel32 is not None:
             _kernel32.CloseHandle(mutex)
+        if lock_fd is not None:
+            try:
+                lock_fd.close()
+            except Exception:
+                pass
+
+
+def _extract_exclude_ip(
+    foreign_addr: str,
+    pid: int,
+    pids_to_name: dict[int, str],
+) -> Optional[tuple[str, str, str, int]]:
+    proc_name = pids_to_name.get(pid)
+    if not proc_name:
+        return None
+    is_vpn = any(kw in proc_name for kw in VPN_KEYWORDS)
+    is_game = any(kw in proc_name for kw in GAME_KEYWORDS)
+    if not (is_vpn or is_game):
+        return None
+
+    ip_part = foreign_addr.rsplit(":", 1)[0].strip("[] ")
+    try:
+        ip_obj = ipaddress.ip_address(ip_part)
+    except ValueError:
+        return None
+
+    if (
+        ip_obj.is_private
+        or ip_obj.is_loopback
+        or ip_obj.is_link_local
+        or ip_obj.is_multicast
+        or ip_obj.is_unspecified
+        or ip_obj.is_reserved
+    ):
+        return None
+
+    prefix = 32 if ip_obj.version == 4 else 128
+    category = "VPN" if is_vpn else "ИГРА"
+    return (str(ip_obj), proc_name, category, prefix)
+
+
+def _parse_linux_connections(pids_to_name: dict[int, str]) -> tuple[Optional[set[tuple[str, str, str, int]]], str]:
+    ips_to_exclude: set[tuple[str, str, str, int]] = set()
+    ss_bin = shutil.which("ss")
+    if not ss_bin:
+        return None, "Утилита ss не найдена"
+    try:
+        res = subprocess.run([ss_bin, "-tunp", "-H"], capture_output=True, text=True, timeout=10)
+        for line in res.stdout.splitlines():
+            tokens = line.split()
+            if len(tokens) < 6:
+                continue
+            m_pid = re.search(r"pid=(\d+)", line)
+            if not m_pid:
+                continue
+            item = _extract_exclude_ip(tokens[5], int(m_pid.group(1)), pids_to_name)
+            if item:
+                ips_to_exclude.add(item)
+        return ips_to_exclude, ""
+    except Exception as e:
+        return None, f"Ошибка ss: {e}"
 
 
 def scan_and_exclude_active_connections() -> dict:
@@ -868,65 +1294,46 @@ def scan_and_exclude_active_connections() -> dict:
         return {"ok": False, "error": "Не удалось получить список процессов", "added": [], "found_total": 0}
 
     ips_to_exclude: set[tuple[str, str, str, int]] = set()
-    try:
-        res = subprocess.run(
-            ["netstat", "-ano"],
-            capture_output=True,
-            creationflags=CREATE_NO_WINDOW,
-            timeout=10,
-        )
-        output = res.stdout.decode("utf-8", errors="ignore")
-        for line in output.splitlines():
-            tokens = line.strip().split()
-            if not tokens or tokens[0] not in ("TCP", "UDP"):
-                continue
+    if IS_WINDOWS:
+        try:
+            res = subprocess.run(
+                ["netstat", "-ano"],
+                capture_output=True,
+                creationflags=CREATE_NO_WINDOW,
+                timeout=10,
+            )
+            output = res.stdout.decode("utf-8", errors="ignore")
+            for line in output.splitlines():
+                tokens = line.strip().split()
+                if not tokens or tokens[0] not in ("TCP", "UDP"):
+                    continue
 
-            proto = tokens[0]
-            if proto == "TCP" and len(tokens) >= 5:
-                foreign_addr, pid_str = tokens[2], tokens[4]
-            elif proto == "UDP" and len(tokens) >= 4:
-                foreign_addr, pid_str = tokens[2], tokens[3]
-            else:
-                continue
+                proto = tokens[0]
+                if proto == "TCP" and len(tokens) >= 5:
+                    foreign_addr, pid_str = tokens[2], tokens[4]
+                elif proto == "UDP" and len(tokens) >= 4:
+                    foreign_addr, pid_str = tokens[2], tokens[3]
+                else:
+                    continue
 
-            if foreign_addr in ("*:*", "0.0.0.0:0", "[::]:", ""):
-                continue
+                if foreign_addr in ("*:*", "0.0.0.0:0", "[::]:", ""):
+                    continue
 
-            try:
-                pid = int(pid_str)
-            except ValueError:
-                continue
+                try:
+                    pid = int(pid_str)
+                except ValueError:
+                    continue
 
-            proc_name = pids_to_name.get(pid)
-            if not proc_name:
-                continue
-
-            is_vpn = any(kw in proc_name for kw in VPN_KEYWORDS)
-            is_game = any(kw in proc_name for kw in GAME_KEYWORDS)
-            if not (is_vpn or is_game):
-                continue
-
-            ip_part = foreign_addr.rsplit(":", 1)[0].strip("[] ")
-            try:
-                ip_obj = ipaddress.ip_address(ip_part)
-            except ValueError:
-                continue
-
-            if (
-                ip_obj.is_private
-                or ip_obj.is_loopback
-                or ip_obj.is_link_local
-                or ip_obj.is_multicast
-                or ip_obj.is_unspecified
-                or ip_obj.is_reserved
-            ):
-                continue
-
-            prefix = 32 if ip_obj.version == 4 else 128
-            category = "VPN" if is_vpn else "ИГРА"
-            ips_to_exclude.add((str(ip_obj), proc_name, category, prefix))
-    except Exception as e:
-        return {"ok": False, "error": f"Ошибка netstat: {e}", "added": [], "found_total": 0}
+                item = _extract_exclude_ip(foreign_addr, pid, pids_to_name)
+                if item:
+                    ips_to_exclude.add(item)
+        except Exception as e:
+            return {"ok": False, "error": f"Ошибка netstat: {e}", "added": [], "found_total": 0}
+    else:
+        parsed_ips, err = _parse_linux_connections(pids_to_name)
+        if parsed_ips is None:
+            return {"ok": False, "error": err, "added": [], "found_total": 0}
+        ips_to_exclude = parsed_ips
 
     ensure_files_exist()
     exclude_file = LISTS_DIR / "ipset-exclude-user.txt"
@@ -1034,12 +1441,29 @@ def check_github_update(timeout: int = 5) -> dict:
         tag = str(data.get("tag_name") or data.get("name") or "").strip()
         clean_latest = tag.lstrip("vV") or APP_VERSION
         has_upd = _parse_version(clean_latest) > _parse_version(APP_VERSION)
+        arch = detect_arch()
+        assets = data.get("assets") or []
         asset_url = ""
-        for asset in data.get("assets") or []:
-            aname = str(asset.get("name", "")).lower()
-            if aname.endswith(".exe"):
-                asset_url = str(asset.get("browser_download_url") or "")
-                break
+        if IS_WINDOWS:
+            if arch == "x86":
+                for asset in assets:
+                    aname = str(asset.get("name", "")).lower()
+                    if "win-x86" in aname:
+                        asset_url = str(asset.get("browser_download_url") or "")
+                        break
+            if not asset_url:
+                for asset in assets:
+                    aname = str(asset.get("name", "")).lower()
+                    if aname.endswith(".exe"):
+                        asset_url = str(asset.get("browser_download_url") or "")
+                        break
+        else:
+            target_tag = f"linux-{arch}"
+            for asset in assets:
+                aname = str(asset.get("name", "")).lower()
+                if target_tag in aname:
+                    asset_url = str(asset.get("browser_download_url") or "")
+                    break
         base_res.update({
             "ok": True,
             "has_update": has_upd,
@@ -1060,8 +1484,10 @@ def check_github_update(timeout: int = 5) -> dict:
 
 
 def download_and_apply_update(asset_url: str) -> tuple[bool, str]:
-    if not asset_url:
-        return False, "В релизе нет .exe файла"
+    if not IS_WINDOWS:
+        return False, "На Linux обновитесь через архив со страницы релиза"
+    if not asset_url or not asset_url.lower().endswith(".exe"):
+        return False, "В релизе нет подходящего .exe файла"
 
     is_compiled = ("__compiled__" in globals()) or bool(
         sys.argv and sys.argv[0] and Path(sys.argv[0]).suffix.lower() == ".exe"

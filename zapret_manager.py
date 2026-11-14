@@ -457,10 +457,19 @@ class AutoTuneWorker(QObject):
         core.kill_winws()
         core.ensure_files_exist()
 
-        if not (core.BIN_DIR / "winws.exe").exists():
-            self.log_msg.emit(f"[ОШИБКА] winws.exe не найден в {core.BIN_DIR}")
+        engine_bin = core.get_engine_binary()
+        engine_name = engine_bin.name
+        if not engine_bin.exists():
+            self.log_msg.emit(f"[ОШИБКА] {engine_name} не найден в {core.BIN_DIR}")
             self.finished_all.emit(results, True)
             return
+
+        if core.IS_LINUX:
+            fw_ok, fw_err = core.setup_linux_firewall("443,19294-19344,50000-50100")
+            if not fw_ok:
+                self.log_msg.emit(f"[ОШИБКА] {fw_err}")
+                self.finished_all.emit(results, True)
+                return
 
         test_cfg = {"fake_sni": "www.google.com", "udp_mode": "narrow"}
         total = len(core.STRATEGIES)
@@ -474,15 +483,20 @@ class AutoTuneWorker(QObject):
             self.log_msg.emit(f"[Тюнер {idx}/{total}] Тестируем: {item['name']}...")
 
             cmd = core.get_winws_args(strat, test_cfg)
+            popen_kw = (
+                {"creationflags": core.CREATE_NO_WINDOW}
+                if core.IS_WINDOWS
+                else {"start_new_session": True}
+            )
             proc = None
             try:
                 proc = subprocess.Popen(
                     cmd,
-                    creationflags=core.CREATE_NO_WINDOW,
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE,
                     cwd=str(core.BIN_DIR),
+                    **popen_kw,
                 )
             except Exception as e:
                 self.log_msg.emit(f"  [Ошибка запуска] {e}")
@@ -516,10 +530,12 @@ class AutoTuneWorker(QObject):
                 except Exception:
                     pass
                 note = "Упал"
-                self.log_msg.emit(f"  [winws упал] {err_txt[:100] if err_txt else 'без текста ошибки'}")
+                self.log_msg.emit(f"  [{engine_name} упал] {err_txt[:100] if err_txt else 'без текста ошибки'}")
                 results.append({"index": idx, "strategy": strat, "yt": False, "ds": False, "note": note})
                 self.step_result.emit(idx, False, False, note)
                 core.cleanup_windivert()
+                if core.IS_LINUX:
+                    core.setup_linux_firewall("443,19294-19344,50000-50100")
                 time.sleep(0.3)
                 continue
 
@@ -535,6 +551,8 @@ class AutoTuneWorker(QObject):
             except Exception:
                 pass
             core.kill_winws(timeout=1.5)
+            if core.IS_LINUX and idx < total and not self._stop_requested:
+                core.setup_linux_firewall("443,19294-19344,50000-50100")
 
             if yt_ok and ds_ok:
                 note = "Отлично"
@@ -1006,7 +1024,7 @@ class MainWindow(QMainWindow):
         header = QVBoxLayout()
         header.setSpacing(2)
         header.addWidget(QLabel("Цитадель обхода - Unfit Edition", objectName="PageTitle"))
-        header.addWidget(QLabel(f"Папка: {core.WORK_DIR}", objectName="PageSub"))
+        header.addWidget(QLabel(f"Папка: {core.WORK_DIR}  •  Платформа: {core.get_platform_label()}", objectName="PageSub"))
         lay.addLayout(header)
 
         self.status_banner = QFrame(objectName="StatusBannerStopped")
@@ -1063,11 +1081,13 @@ class MainWindow(QMainWindow):
         auto_lay = QVBoxLayout(auto_card)
         auto_lay.setContentsMargins(18, 16, 18, 16)
         auto_lay.setSpacing(8)
-        auto_lay.addWidget(QLabel("Автозапуск с Windows", objectName="SectionTitle"))
+        auto_lay.addWidget(QLabel("Автозапуск с Windows" if core.IS_WINDOWS else "Автозапуск (systemd)", objectName="SectionTitle"))
         self.dash_autorun_status = QLabel("Проверка...")
         self.dash_autorun_status.setStyleSheet("font-size: 13px; font-weight: 700;")
         self.dash_autorun_hint = QLabel(
             "Запускает обход автоматически при включении и входе в систему (включая Fast Startup), от имени SYSTEM без окон UAC."
+            if core.IS_WINDOWS
+            else "Регистрирует systemd-сервис unfit-zapret.service для автоматического запуска при старте Linux."
         )
         self.dash_autorun_hint.setStyleSheet("color: #A79AB8; font-size: 11px;")
         self.dash_autorun_hint.setWordWrap(True)
@@ -1573,7 +1593,7 @@ class MainWindow(QMainWindow):
             self.dash_status_title.setStyleSheet("color: #FDE68A; font-size: 17px; font-weight: 800;")
             pids = core.get_winws_pids()
             pid_str = f" (PID: {', '.join(map(str, pids))})" if pids else ""
-            self.dash_status_desc.setText(f"Процесс winws.exe защищает трафик в фоне{pid_str}.")
+            self.dash_status_desc.setText(f"Процесс {core.get_engine_name()} защищает трафик в фоне{pid_str}.")
             self.btn_toggle_bypass.setText("Остановить обход")
             self.btn_toggle_bypass.setObjectName("DangerStop")
             self.sb_status_lbl.setText("● Активен")
@@ -1615,7 +1635,7 @@ class MainWindow(QMainWindow):
         info = core.get_autorun_info()
         if info["enabled"]:
             if info["path_matches"]:
-                self.dash_autorun_status.setText("ВКЛЮЧЁН (Boot + Logon)")
+                self.dash_autorun_status.setText("ВКЛЮЧЁН (Boot + Logon)" if core.IS_WINDOWS else "ВКЛЮЧЁН (systemd)")
                 self.dash_autorun_status.setStyleSheet("color: #FBBF24; font-size: 13px; font-weight: 700;")
                 self.sb_autorun_lbl.setText("Автостарт: ВКЛ")
                 self.sb_autorun_lbl.setStyleSheet("color: #FBBF24; font-size: 11px;")
@@ -1699,7 +1719,7 @@ class MainWindow(QMainWindow):
                 self.lbl_update_status.setText(f"Версия v{core.APP_VERSION} ({info.get('error', 'офлайн')})")
 
     def _on_open_update_release(self):
-        if self._latest_asset_url and Path(sys.argv[0]).suffix.lower() == ".exe":
+        if core.IS_WINDOWS and self._latest_asset_url.lower().endswith(".exe") and Path(sys.argv[0]).suffix.lower() == ".exe":
             self.btn_sb_update.setEnabled(False)
             self.btn_open_release.setEnabled(False)
             self.btn_open_release.setText("Скачивание...")
@@ -1746,17 +1766,18 @@ class MainWindow(QMainWindow):
     def _on_toggle_bypass(self):
         self.btn_toggle_bypass.setEnabled(False)
         self.btn_restart_bypass.setEnabled(False)
+        engine_name = core.get_engine_name()
         if core.is_winws_running():
-            self.append_log("Остановка winws.exe...")
+            self.append_log(f"Остановка {engine_name}...")
             self._run_bg(core.kill_winws, self._after_stop_bypass)
         else:
-            self.append_log("Запуск обхода winws.exe...")
+            self.append_log(f"Запуск обхода {engine_name}...")
             self._run_bg(core.start_bypass_background, self._after_start_bypass)
 
     def _on_restart_bypass(self):
         self.btn_toggle_bypass.setEnabled(False)
         self.btn_restart_bypass.setEnabled(False)
-        self.append_log("Перезапуск обхода winws.exe...")
+        self.append_log(f"Перезапуск обхода {core.get_engine_name()}...")
         self._run_bg(core.start_bypass_background, self._after_start_bypass)
 
     def _after_start_bypass(self, res):
@@ -1786,7 +1807,7 @@ class MainWindow(QMainWindow):
             self.append_log("Отключение автозапуска...")
             self._run_bg(core.disable_autorun, self._after_autorun_change)
         else:
-            self.append_log("Настройка автозапуска (Boot + Logon XML)...")
+            self.append_log("Настройка автозапуска (Boot + Logon XML)..." if core.IS_WINDOWS else "Настройка systemd-автозапуска...")
             self._run_bg(core.enable_autorun, self._after_autorun_change)
 
     def _after_autorun_change(self, res):
@@ -2067,13 +2088,24 @@ class MainWindow(QMainWindow):
         self.refresh_all_state()
 
     def _refresh_diagnostics(self):
-        checks = [
-            ("winws.exe", (core.BIN_DIR / "winws.exe").exists()),
-            ("WinDivert.dll", (core.BIN_DIR / "WinDivert.dll").exists()),
-            ("WinDivert64.sys", (core.BIN_DIR / "WinDivert64.sys").exists()),
-            ("cygwin1.dll", (core.BIN_DIR / "cygwin1.dll").exists()),
-            ("zapret_config.json", core.CONFIG_FILE.exists()),
-        ]
+        if core.IS_WINDOWS:
+            drv = "WinDivert32.sys" if (core.BIN_DIR / "WinDivert32.sys").exists() and not (core.BIN_DIR / "WinDivert64.sys").exists() else "WinDivert64.sys"
+            checks = [
+                ("winws.exe", (core.BIN_DIR / "winws.exe").exists()),
+                ("WinDivert.dll", (core.BIN_DIR / "WinDivert.dll").exists()),
+                (drv, (core.BIN_DIR / drv).exists()),
+                ("cygwin1.dll", (core.BIN_DIR / "cygwin1.dll").exists()),
+                ("zapret_config.json", core.CONFIG_FILE.exists()),
+            ]
+        else:
+            import shutil as _shutil
+            engine_bin = core.get_engine_binary()
+            checks = [
+                (engine_bin.name, engine_bin.exists()),
+                ("nft/iptables", bool(_shutil.which("nft") or _shutil.which("iptables"))),
+                ("curl", bool(_shutil.which("curl"))),
+                ("zapret_config.json", core.CONFIG_FILE.exists()),
+            ]
         parts = [f"{name}: {'OK' if ok else 'НЕТ'}" for name, ok in checks]
         autorun_log_info = ""
         if core.AUTORUN_LOG_FILE.exists():
@@ -2083,11 +2115,14 @@ class MainWindow(QMainWindow):
                     autorun_log_info = f"\nПоследняя запись автозапуска: {lines[-1]}"
             except Exception:
                 pass
-        self.diag_label.setText("Компоненты:  " + "   |   ".join(parts) + autorun_log_info)
+        self.diag_label.setText(f"[{core.get_platform_label()}]  " + "   |   ".join(parts) + autorun_log_info)
 
     def _on_open_work_dir(self):
         try:
-            os.startfile(str(core.WORK_DIR))
+            if core.IS_WINDOWS:
+                os.startfile(str(core.WORK_DIR))
+            else:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(core.WORK_DIR)))
         except Exception as e:
             self.append_log(f"Не удалось открыть папку: {e}")
 

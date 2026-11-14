@@ -6,6 +6,8 @@ __pycache__/
 *.onefile-build/
 embedded_assets.zip
 .assets_version
+dist_win/
+dist_linux/
 autorun.log
 *.log
 /*.exe
