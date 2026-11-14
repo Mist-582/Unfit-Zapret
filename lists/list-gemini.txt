@@ -1,0 +1,11 @@
+gemini.google.com
+bard.google.com
+aistudio.google.com
+generativelanguage.googleapis.com
+alkalimakersuite-pa.clients6.google.com
+alkalicore-pa.clients6.google.com
+geller-pa.googleapis.com
+ai.google.dev
+emakersuite.google.com
+geller-pa.clients6.google.com
+generative-ai.googleusercontent.com
