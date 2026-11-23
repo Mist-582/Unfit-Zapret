@@ -19,7 +19,7 @@ jobs:
           python-version: "3.12"
       - name: Install dependencies
         run: |
-          pip install PyQt6 nuitka zstandard ordered-set
+          pip install PyQt6 cryptography nuitka zstandard ordered-set
       - name: Build Windows x64 and x86 packages
         run: |
           python build_zip.py --assets
