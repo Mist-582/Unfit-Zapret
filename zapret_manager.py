@@ -78,6 +78,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QScrollArea,
+    QScrollBar,
     QSpinBox,
     QStackedWidget,
     QSystemTrayIcon,
@@ -450,6 +451,35 @@ class SimpleWorker(QObject):
             self.finished_res.emit((False, str(e)))
 
 
+class UpdateWorker(QObject):
+    progress = pyqtSignal(int, int, str)
+    finished_res = pyqtSignal(bool, str)
+
+    def __init__(self, asset_url: str):
+        super().__init__()
+        self.asset_url = asset_url
+        self.cancel_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def cancel(self):
+        self.cancel_event.set()
+
+    def _run(self):
+        try:
+            ok, msg = core.download_and_apply_update(
+                self.asset_url,
+                progress_cb=self.progress.emit,
+                cancel_event=self.cancel_event,
+            )
+            self.finished_res.emit(bool(ok), str(msg))
+        except Exception as e:
+            self.finished_res.emit(False, str(e))
+
+
 class AutoTuneWorker(QObject):
     step_started = pyqtSignal(int, int, str)
     step_result = pyqtSignal(int, bool, bool, bool, str)
@@ -605,6 +635,60 @@ class AutoTuneWorker(QObject):
             self.finished_all.emit(results, self._stop_requested or aborted_by_error)
 
 
+class SmoothScrollArea(QScrollArea):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._target = 0
+        self._timer = QTimer(self)
+        self._timer.setInterval(16)
+        self._timer.timeout.connect(self._step)
+        vbar = self.verticalScrollBar()
+        vbar.setSingleStep(24)
+        vbar.sliderPressed.connect(self._cancel_anim)
+        vbar.actionTriggered.connect(self._on_action)
+
+    def _cancel_anim(self):
+        if self._timer.isActive():
+            self._timer.stop()
+        self._target = self.verticalScrollBar().value()
+
+    def _on_action(self, action: int):
+        self._cancel_anim()
+
+    def wheelEvent(self, event):
+        vbar = self.verticalScrollBar()
+        if vbar.maximum() <= vbar.minimum():
+            super().wheelEvent(event)
+            return
+        px = event.pixelDelta().y()
+        delta = px if px != 0 else round(event.angleDelta().y() * 0.65)
+        if delta == 0:
+            super().wheelEvent(event)
+            return
+        base = self._target if self._timer.isActive() else vbar.value()
+        self._target = max(vbar.minimum(), min(vbar.maximum(), base - delta))
+        if not self._timer.isActive():
+            self._timer.start()
+        event.accept()
+
+    def _step(self):
+        vbar = self.verticalScrollBar()
+        cur = vbar.value()
+        diff = self._target - cur
+        if abs(diff) <= 1:
+            vbar.setValue(self._target)
+            self._timer.stop()
+            return
+        step = diff * 0.28
+        nxt = cur + (math.ceil(step) if step > 0 else math.floor(step))
+        if nxt == cur:
+            nxt = cur + (1 if diff > 0 else -1)
+        vbar.setValue(nxt)
+
+
 APP_STYLESHEET = """
 QMainWindow {
     background-color: #08060D;
@@ -718,7 +802,7 @@ QPushButton#PrimaryStart {
     color: #FFFFFF;
     border: 1px solid #FB7185;
     border-radius: 10px;
-    padding: 11px 22px;
+    padding: 10px 18px;
     font-size: 13px;
     font-weight: 700;
 }
@@ -737,7 +821,7 @@ QPushButton#DangerStop {
     color: #FDA4AF;
     border: 1px solid #E11D48;
     border-radius: 10px;
-    padding: 11px 22px;
+    padding: 10px 18px;
     font-size: 13px;
     font-weight: 700;
 }
@@ -757,7 +841,7 @@ QPushButton#AccentBtn {
     color: #FFFFFF;
     border: 1px solid #A855F7;
     border-radius: 10px;
-    padding: 9px 18px;
+    padding: 9px 14px;
     font-size: 13px;
     font-weight: 700;
 }
@@ -869,21 +953,61 @@ QPlainTextEdit {
 }
 
 QScrollBar:vertical {
-    background: #0B0712;
-    width: 8px;
-    margin: 0;
-    border-radius: 4px;
+    background: rgba(11, 7, 18, 180);
+    width: 12px;
+    margin: 2px 1px 2px 1px;
+    border: none;
+    border-radius: 6px;
 }
 QScrollBar::handle:vertical {
-    background: #581C5E;
-    min-height: 28px;
-    border-radius: 4px;
+    background: #6B2173;
+    min-height: 36px;
+    border-radius: 5px;
+    margin: 1px;
 }
 QScrollBar::handle:vertical:hover {
     background: #E11D48;
 }
+QScrollBar::handle:vertical:pressed {
+    background: #FF1E42;
+}
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-    height: 0;
+    height: 0px;
+    border: none;
+    background: none;
+}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+    background: transparent;
+    border: none;
+}
+
+QScrollBar:horizontal {
+    background: rgba(11, 7, 18, 180);
+    height: 12px;
+    margin: 1px 2px 1px 2px;
+    border: none;
+    border-radius: 6px;
+}
+QScrollBar::handle:horizontal {
+    background: #6B2173;
+    min-width: 36px;
+    border-radius: 5px;
+    margin: 1px;
+}
+QScrollBar::handle:horizontal:hover {
+    background: #E11D48;
+}
+QScrollBar::handle:horizontal:pressed {
+    background: #FF1E42;
+}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+    width: 0px;
+    border: none;
+    background: none;
+}
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+    background: transparent;
+    border: none;
 }
 
 QMenu {
@@ -900,14 +1024,17 @@ QMenu::item:selected {
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, ipc_server: QLocalServer | None = None):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
-        self.resize(950, 650)
-        self.setMinimumSize(850, 570)
+        self.resize(1120, 740)
+        self.setMinimumSize(980, 640)
 
+        self._ipc_server = ipc_server
         self._active_workers: list[SimpleWorker] = []
         self._tune_worker: AutoTuneWorker | None = None
+        self._update_worker: UpdateWorker | None = None
+        self._latest_version: str = ""
         self._is_running: bool = False
         self._tray_notified_once: bool = False
         self._force_quit: bool = False
@@ -965,6 +1092,8 @@ class MainWindow(QMainWindow):
             te.viewport().setCursor(self.cursors["ibeam"])
         for tbl in widget.findChildren(QTableWidget):
             tbl.viewport().setCursor(self.cursors["pointer"])
+        for bar in widget.findChildren(QScrollBar):
+            bar.setCursor(self.cursors["pointer"])
 
     def _build_ui(self):
         self.root_canvas = DemonAuraWidget()
@@ -974,7 +1103,7 @@ class MainWindow(QMainWindow):
         main_layout.setSpacing(0)
 
         sidebar = QFrame(objectName="Sidebar")
-        sidebar.setFixedWidth(232)
+        sidebar.setFixedWidth(216)
         sb_layout = QVBoxLayout(sidebar)
         sb_layout.setContentsMargins(14, 18, 14, 16)
         sb_layout.setSpacing(6)
@@ -1061,29 +1190,32 @@ class MainWindow(QMainWindow):
             self._refresh_diagnostics()
 
     def _build_dashboard_page(self) -> QWidget:
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll = SmoothScrollArea()
         page = QWidget()
         lay = QVBoxLayout(page)
-        lay.setContentsMargins(24, 22, 24, 20)
+        lay.setContentsMargins(18, 20, 14, 20)
         lay.setSpacing(14)
 
         header = QVBoxLayout()
         header.setSpacing(2)
-        header.addWidget(QLabel("Цитадель обхода - Unfit Edition", objectName="PageTitle"))
-        header.addWidget(QLabel(f"Папка: {core.WORK_DIR}  •  Платформа: {core.get_platform_label()}", objectName="PageSub"))
+        dash_title = QLabel("Цитадель обхода - Unfit Edition", objectName="PageTitle")
+        dash_title.setWordWrap(True)
+        header.addWidget(dash_title)
+        sub_lbl = QLabel(f"Папка: {core.WORK_DIR}  •  Платформа: {core.get_platform_label()}", objectName="PageSub")
+        sub_lbl.setWordWrap(True)
+        header.addWidget(sub_lbl)
         lay.addLayout(header)
 
         self.status_banner = QFrame(objectName="StatusBannerStopped")
         banner_lay = QHBoxLayout(self.status_banner)
-        banner_lay.setContentsMargins(20, 18, 20, 18)
-        banner_lay.setSpacing(14)
+        banner_lay.setContentsMargins(16, 16, 16, 16)
+        banner_lay.setSpacing(12)
 
         left_info = QVBoxLayout()
         left_info.setSpacing(4)
         self.dash_status_title = QLabel("ОБХОД ОСТАНОВЛЕН")
         self.dash_status_title.setStyleSheet("color: #FB7185; font-size: 17px; font-weight: 800;")
+        self.dash_status_title.setWordWrap(True)
         self.dash_status_desc = QLabel("Нажмите «Активировать обход», чтобы пробудить DPI-защиту.")
         self.dash_status_desc.setStyleSheet("color: #E2D9F0; font-size: 12px;")
         self.dash_status_desc.setWordWrap(True)
@@ -1092,7 +1224,7 @@ class MainWindow(QMainWindow):
         banner_lay.addLayout(left_info, 1)
 
         btn_col = QHBoxLayout()
-        btn_col.setSpacing(10)
+        btn_col.setSpacing(8)
         self.btn_toggle_bypass = QPushButton("Активировать обход", objectName="PrimaryStart")
         self.btn_toggle_bypass.clicked.connect(self._on_toggle_bypass)
 
@@ -1154,31 +1286,36 @@ class MainWindow(QMainWindow):
         lay.addLayout(mid_row)
 
         tg_card = QFrame(objectName="Card")
-        tg_lay = QHBoxLayout(tg_card)
+        tg_lay = QVBoxLayout(tg_card)
         tg_lay.setContentsMargins(18, 14, 18, 14)
-        tg_lay.setSpacing(12)
-        tg_left = QVBoxLayout()
-        tg_left.setSpacing(3)
-        tg_left.addWidget(QLabel("Telegram WS-Мост (MTProto Proxy)", objectName="SectionTitle"))
+        tg_lay.setSpacing(8)
+        tg_top = QHBoxLayout()
+        tg_top.setSpacing(10)
+        tg_sec_lbl = QLabel("Telegram WS-Мост (MTProto Proxy)", objectName="SectionTitle")
+        tg_sec_lbl.setWordWrap(True)
+        tg_top.addWidget(tg_sec_lbl, 1)
         self.dash_tg_status = QLabel("● Остановлен")
         self.dash_tg_status.setStyleSheet("color: #FB7185; font-size: 12px; font-weight: 700;")
+        tg_top.addWidget(self.dash_tg_status)
+        tg_lay.addLayout(tg_top)
+
         self.dash_tg_stats = QLabel("Трафик: WS 0 | CF 0 | ↑ 0 B | ↓ 0 B")
         self.dash_tg_stats.setObjectName("Muted")
-        tg_left.addWidget(self.dash_tg_status)
-        tg_left.addWidget(self.dash_tg_stats)
-        tg_lay.addLayout(tg_left, 1)
+        self.dash_tg_stats.setWordWrap(True)
+        tg_lay.addWidget(self.dash_tg_stats)
 
         tg_btns = QHBoxLayout()
         tg_btns.setSpacing(8)
-        self.btn_tg_toggle = QPushButton("Запустить TG-Мост", objectName="AccentBtn")
+        self.btn_tg_toggle = QPushButton("Запустить Мост", objectName="AccentBtn")
         self.btn_tg_toggle.clicked.connect(self._on_toggle_tg_proxy)
         self.btn_tg_open = QPushButton("Открыть в Telegram", objectName="PrimaryStart")
         self.btn_tg_open.clicked.connect(self._on_open_tg_link)
-        self.btn_tg_copy = QPushButton("Копировать ссылку", objectName="SecondaryBtn")
+        self.btn_tg_copy = QPushButton("Копировать", objectName="SecondaryBtn")
         self.btn_tg_copy.clicked.connect(self._on_copy_tg_link)
         tg_btns.addWidget(self.btn_tg_toggle)
         tg_btns.addWidget(self.btn_tg_open)
         tg_btns.addWidget(self.btn_tg_copy)
+        tg_btns.addStretch(1)
         tg_lay.addLayout(tg_btns)
         lay.addWidget(tg_card)
 
@@ -1193,6 +1330,7 @@ class MainWindow(QMainWindow):
         test_title_col.addWidget(QLabel("Проверка доступности сайтов", objectName="SectionTitle"))
         self.test_summary_lbl = QLabel("Параллельная проверка Discord, YouTube, Telegram и X за ~4 сек")
         self.test_summary_lbl.setObjectName("Muted")
+        self.test_summary_lbl.setWordWrap(True)
         test_title_col.addWidget(self.test_summary_lbl)
         test_top.addLayout(test_title_col, 1)
 
@@ -1234,12 +1372,12 @@ class MainWindow(QMainWindow):
         h_text = QVBoxLayout()
         h_text.setSpacing(2)
         h_text.addWidget(QLabel("Авто-Тюнинг стратегий", objectName="PageTitle"))
-        h_text.addWidget(
-            QLabel(
-                f"Автоматический перебор всех {len(core.STRATEGIES)} стратегий 2026 года (YouTube, Discord, Telegram)",
-                objectName="PageSub",
-            )
+        tune_sub = QLabel(
+            f"Автоматический перебор всех {len(core.STRATEGIES)} стратегий 2026 года (YouTube, Discord, Telegram)",
+            objectName="PageSub",
         )
+        tune_sub.setWordWrap(True)
+        h_text.addWidget(tune_sub)
         header.addLayout(h_text, 1)
 
         self.btn_tune_start = QPushButton("Начать подбор", objectName="AccentBtn")
@@ -1259,6 +1397,7 @@ class MainWindow(QMainWindow):
         prog_lay.setSpacing(8)
         self.tune_status_lbl = QLabel("Нажмите «Начать подбор», чтобы проверить все стратегии.")
         self.tune_status_lbl.setStyleSheet("color: #E2D9F0; font-size: 12px;")
+        self.tune_status_lbl.setWordWrap(True)
         self.tune_progress = QProgressBar()
         self.tune_progress.setRange(0, len(core.STRATEGIES))
         self.tune_progress.setValue(0)
@@ -1267,6 +1406,7 @@ class MainWindow(QMainWindow):
         lay.addWidget(prog_card)
 
         self.tune_table = QTableWidget(len(core.STRATEGIES), 6)
+        self.tune_table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.tune_table.setHorizontalHeaderLabels(["#", "Стратегия", "YouTube", "Discord", "Telegram", "Результат"])
         self.tune_table.setAlternatingRowColors(True)
         self.tune_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -1297,6 +1437,7 @@ class MainWindow(QMainWindow):
         bottom_row = QHBoxLayout()
         hint = QLabel("Подсказка: выберите любую строку и нажмите «Применить выбранную» (или двойной клик).")
         hint.setObjectName("Muted")
+        hint.setWordWrap(True)
         bottom_row.addWidget(hint, 1)
         self.btn_tune_apply = QPushButton("Применить выбранную и запустить", objectName="PrimaryStart")
         self.btn_tune_apply.clicked.connect(self._on_apply_selected_tune)
@@ -1308,18 +1449,18 @@ class MainWindow(QMainWindow):
     def _build_settings_page(self) -> QWidget:
         page = QWidget()
         lay = QVBoxLayout(page)
-        lay.setContentsMargins(24, 22, 24, 20)
+        lay.setContentsMargins(18, 20, 14, 20)
         lay.setSpacing(14)
 
         lay.addWidget(QLabel("Настройка параметров", objectName="PageTitle"))
-        lay.addWidget(QLabel("Выберите стратегию DPI-обхода, порты UDP и маскировку TLS SNI", objectName="PageSub"))
+        set_sub = QLabel("Выберите стратегию DPI-обхода, порты UDP и маскировку TLS SNI", objectName="PageSub")
+        set_sub.setWordWrap(True)
+        lay.addWidget(set_sub)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll = SmoothScrollArea()
         scroll_content = QWidget()
         scroll_lay = QVBoxLayout(scroll_content)
-        scroll_lay.setContentsMargins(0, 0, 6, 0)
+        scroll_lay.setContentsMargins(0, 0, 12, 0)
         scroll_lay.setSpacing(14)
 
         s_card = QFrame(objectName="Card")
@@ -1328,6 +1469,8 @@ class MainWindow(QMainWindow):
         s_lay.setSpacing(10)
         s_lay.addWidget(QLabel("1. Стратегия обхода DPI", objectName="SectionTitle"))
         self.combo_strategy = QComboBox()
+        self.combo_strategy.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.combo_strategy.setMinimumContentsLength(24)
         for i, item in enumerate(core.STRATEGIES, 1):
             self.combo_strategy.addItem(f"#{i}  {item['name']} - {item['desc']}", i)
         s_lay.addWidget(self.combo_strategy)
@@ -1339,9 +1482,9 @@ class MainWindow(QMainWindow):
         u_lay.setSpacing(8)
         u_lay.addWidget(QLabel("2. Диапазон UDP портов (Discord Voice)", objectName="SectionTitle"))
         self.udp_group = QButtonGroup(self)
-        self.rb_udp_narrow = QRadioButton("NARROW (50000–50100) - рекомендуется: низкий пинг в играх и совместимость с VPN")
-        self.rb_udp_wide = QRadioButton("WIDE (50000–65535) - полный диапазон, если голос в Discord не подключается")
-        self.rb_udp_disabled = QRadioButton("DISABLED - отключить UDP-обход голоса")
+        self.rb_udp_narrow = QRadioButton("NARROW (50000–50100) — низкий пинг и VPN")
+        self.rb_udp_wide = QRadioButton("WIDE (50000–65535) — все порты Discord Voice")
+        self.rb_udp_disabled = QRadioButton("DISABLED — отключить UDP-обход голоса")
         for rb in (self.rb_udp_narrow, self.rb_udp_wide, self.rb_udp_disabled):
             self.udp_group.addButton(rb)
             u_lay.addWidget(rb)
@@ -1355,8 +1498,10 @@ class MainWindow(QMainWindow):
         sni_row = QHBoxLayout()
         sni_row.setSpacing(10)
         self.combo_sni = QComboBox()
+        self.combo_sni.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.combo_sni.setMinimumContentsLength(18)
         for sni in core.POPULAR_SNIS:
-            label = "random (случайный при каждом запуске)" if sni == "random" else sni
+            label = "random (случайный при запуске)" if sni == "random" else sni
             self.combo_sni.addItem(label, sni)
         self.combo_sni.addItem("Свой домен вручную...", "__custom__")
         self.combo_sni.currentIndexChanged.connect(self._on_sni_combo_changed)
@@ -1373,7 +1518,7 @@ class MainWindow(QMainWindow):
         ui_lay.setContentsMargins(18, 16, 18, 16)
         ui_lay.setSpacing(8)
         ui_lay.addWidget(QLabel("4. Поведение окна", objectName="SectionTitle"))
-        self.chk_minimize_tray = QCheckBox("Сворачивать в системный трей при нажатии на крестик (обход продолжит работать)")
+        self.chk_minimize_tray = QCheckBox("Сворачивать в трей при закрытии окна")
         ui_lay.addWidget(self.chk_minimize_tray)
         scroll_lay.addWidget(ui_card)
 
@@ -1382,8 +1527,8 @@ class MainWindow(QMainWindow):
         tg_set_lay.setContentsMargins(18, 16, 18, 16)
         tg_set_lay.setSpacing(8)
         tg_set_lay.addWidget(QLabel("5. Обход Telegram (DPI + WS-Мост)", objectName="SectionTitle"))
-        self.chk_tg_dpi = QCheckBox("Включить DPI-обход для Telegram (Web, звонки и прямые IP дата-центров)")
-        self.chk_tg_proxy = QCheckBox("Автозапуск встроенного Telegram WS-Моста (MTProto прокси 127.0.0.1)")
+        self.chk_tg_dpi = QCheckBox("DPI-обход Telegram (Web, звонки и подсети DC)")
+        self.chk_tg_proxy = QCheckBox("Автозапуск Telegram WS-Моста (127.0.0.1)")
         port_row = QHBoxLayout()
         port_row.setSpacing(10)
         port_row.addWidget(QLabel("Локальный порт WS-Моста:"))
@@ -1417,9 +1562,12 @@ class MainWindow(QMainWindow):
         lay.setSpacing(14)
 
         lay.addWidget(QLabel("Исключения VPN, игр и доменов", objectName="PageTitle"))
-        lay.addWidget(
-            QLabel("Автоматический поиск IP запущенных VPN/игр и быстрое редактирование пользовательских списков", objectName="PageSub")
+        exc_sub = QLabel(
+            "Автоматический поиск IP запущенных VPN/игр и быстрое редактирование пользовательских списков",
+            objectName="PageSub",
         )
+        exc_sub.setWordWrap(True)
+        lay.addWidget(exc_sub)
 
         scan_card = QFrame(objectName="Card")
         scan_lay = QHBoxLayout(scan_card)
@@ -1447,6 +1595,8 @@ class MainWindow(QMainWindow):
         top_ed = QHBoxLayout()
         top_ed.addWidget(QLabel("Редактор списка:", objectName="SectionTitle"))
         self.combo_list_file = QComboBox()
+        self.combo_list_file.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.combo_list_file.setMinimumContentsLength(22)
         self.combo_list_file.addItem("ipset-exclude-user.txt (Исключённые IP)", "ipset-exclude-user.txt")
         self.combo_list_file.addItem("list-exclude-user.txt (Исключённые домены)", "list-exclude-user.txt")
         self.combo_list_file.addItem("list-general-user.txt (Дополнительные домены для обхода)", "list-general-user.txt")
@@ -1483,7 +1633,9 @@ class MainWindow(QMainWindow):
         t_col = QVBoxLayout()
         t_col.setSpacing(2)
         t_col.addWidget(QLabel("Журнал и диагностика", objectName="PageTitle"))
-        t_col.addWidget(QLabel("Состояние компонентов bin/ и логи автозапуска", objectName="PageSub"))
+        logs_sub = QLabel("Состояние компонентов bin/ и логи автозапуска", objectName="PageSub")
+        logs_sub.setWordWrap(True)
+        t_col.addWidget(logs_sub)
         top.addLayout(t_col, 1)
 
         btn_open_dir = QPushButton("Открыть папку", objectName="SecondaryBtn")
@@ -1510,13 +1662,18 @@ class MainWindow(QMainWindow):
         return page
 
     def _build_about_page(self) -> QWidget:
+        scroll = SmoothScrollArea()
         page = QWidget()
         lay = QVBoxLayout(page)
-        lay.setContentsMargins(24, 22, 24, 20)
+        lay.setContentsMargins(18, 20, 14, 20)
         lay.setSpacing(14)
 
-        lay.addWidget(QLabel("Об авторе и проекте", objectName="PageTitle"))
-        lay.addWidget(QLabel("Полезные ссылки, обновления и резервный VPN-сервис", objectName="PageSub"))
+        about_title = QLabel("Об авторе и проекте", objectName="PageTitle")
+        about_title.setWordWrap(True)
+        lay.addWidget(about_title)
+        about_sub = QLabel("Полезные ссылки, обновления и резервный VPN-сервис", objectName="PageSub")
+        about_sub.setWordWrap(True)
+        lay.addWidget(about_sub)
 
         dev_card = QFrame(objectName="Card")
         dev_lay = QVBoxLayout(dev_card)
@@ -1535,6 +1692,7 @@ class MainWindow(QMainWindow):
         dev_info.setSpacing(2)
         dev_name = QLabel(f"Mist-582  •  Unfit Zapret v{core.APP_VERSION}")
         dev_name.setStyleSheet("color: #FFF5F7; font-size: 16px; font-weight: 800;")
+        dev_name.setWordWrap(True)
         dev_desc = QLabel("Разработка и поддержка Unfit Zapret. Обновления, новости и помощь - в наших каналах.")
         dev_desc.setObjectName("Muted")
         dev_desc.setWordWrap(True)
@@ -1547,6 +1705,7 @@ class MainWindow(QMainWindow):
         upd_row.setSpacing(10)
         self.lbl_update_status = QLabel(f"Текущая версия: v{core.APP_VERSION}")
         self.lbl_update_status.setObjectName("Muted")
+        self.lbl_update_status.setWordWrap(True)
         self.btn_check_update = QPushButton("Проверить обновления", objectName="SecondaryBtn")
         self.btn_check_update.clicked.connect(lambda: self._on_check_updates(silent=False))
         self.btn_open_release = QPushButton("Обновить на GitHub", objectName="PrimaryStart")
@@ -1561,9 +1720,9 @@ class MainWindow(QMainWindow):
         links_grid.setSpacing(10)
         links = [
             ("GitHub • Mist-582", "https://github.com/Mist-582", "SecondaryBtn"),
-            ("Telegram канал • @UnfitShop", "https://t.me/UnfitShop", "SecondaryBtn"),
-            ("Discord сервер • Сообщество", "https://discord.gg/8RwY28XkY3", "SecondaryBtn"),
-            ("Связаться в Telegram • @mist_582", "https://t.me/mist_582", "SecondaryBtn"),
+            ("Канал • @UnfitShop", "https://t.me/UnfitShop", "SecondaryBtn"),
+            ("Discord сервер", "https://discord.gg/8RwY28XkY3", "SecondaryBtn"),
+            ("Telegram • @mist_582", "https://t.me/mist_582", "SecondaryBtn"),
         ]
         for idx, (text, url, obj_name) in enumerate(links):
             btn = QPushButton(text, objectName=obj_name)
@@ -1580,6 +1739,7 @@ class MainWindow(QMainWindow):
         vpn_top = QHBoxLayout()
         vpn_title = QLabel("Unfit VPN  •  Протокол VLESS")
         vpn_title.setStyleSheet("color: #FDE68A; font-size: 15px; font-weight: 800;")
+        vpn_title.setWordWrap(True)
         vpn_badge = QLabel("Резервный обход")
         vpn_badge.setStyleSheet(
             "background-color: rgba(225, 29, 72, 65); color: #FFE4E6; "
@@ -1607,8 +1767,10 @@ class MainWindow(QMainWindow):
         free_lay.setSpacing(6)
         free_hdr = QLabel("Бесплатно навсегда")
         free_hdr.setStyleSheet("color: #34D399; font-size: 13px; font-weight: 700;")
+        free_hdr.setWordWrap(True)
         free_items = QLabel("• Личный ключ VLESS\n• Безлимитный трафик\n• Стабильная скорость")
         free_items.setStyleSheet("color: #E2D9F0; font-size: 12px; line-height: 1.4;")
+        free_items.setWordWrap(True)
         free_lay.addWidget(free_hdr)
         free_lay.addWidget(free_items)
         free_lay.addStretch()
@@ -1620,8 +1782,10 @@ class MainWindow(QMainWindow):
         prem_lay.setSpacing(6)
         prem_hdr = QLabel("Premium - 100 ₽/мес · 800 ₽/год")
         prem_hdr.setStyleSheet("color: #FBBF24; font-size: 13px; font-weight: 700;")
+        prem_hdr.setWordWrap(True)
         prem_items = QLabel("• Полный обход белых списков\n• 30+ серверов в разных странах\n• Турбо-скорость для 4K и игр")
         prem_items.setStyleSheet("color: #E2D9F0; font-size: 12px; line-height: 1.4;")
+        prem_items.setWordWrap(True)
         prem_lay.addWidget(prem_hdr)
         prem_lay.addWidget(prem_items)
         prem_lay.addStretch()
@@ -1631,9 +1795,9 @@ class MainWindow(QMainWindow):
 
         vpn_btns = QHBoxLayout()
         vpn_btns.setSpacing(10)
-        btn_vpn_bot = QPushButton("Забрать ключ в @UnfitShopVPN_BOT", objectName="PrimaryStart")
+        btn_vpn_bot = QPushButton("Ключ в @UnfitShopVPN_BOT", objectName="PrimaryStart")
         btn_vpn_bot.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("https://t.me/UnfitShopVPN_BOT")))
-        btn_vpn_chan = QPushButton("Канал Unfit VPN", objectName="AccentBtn")
+        btn_vpn_chan = QPushButton("Канал VPN", objectName="AccentBtn")
         btn_vpn_chan.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("https://t.me/unfitvpn")))
         vpn_btns.addWidget(btn_vpn_bot, 1)
         vpn_btns.addWidget(btn_vpn_chan)
@@ -1641,7 +1805,8 @@ class MainWindow(QMainWindow):
 
         lay.addWidget(vpn_card)
         lay.addStretch()
-        return page
+        scroll.setWidget(page)
+        return scroll
 
     def _setup_tray(self):
         self.tray_icon = QSystemTrayIcon(self.icon_idle, self)
@@ -1717,7 +1882,7 @@ class MainWindow(QMainWindow):
             mode_note = f"127.0.0.1:{st['port'] if in_proc else port}"
             self.dash_tg_status.setText(f"● Активен ({mode_note})")
             self.dash_tg_status.setStyleSheet("color: #34D399; font-size: 12px; font-weight: 700;")
-            self.btn_tg_toggle.setText("Остановить TG-Мост")
+            self.btn_tg_toggle.setText("Остановить Мост")
             self.btn_tg_toggle.setObjectName("DangerStop")
             if in_proc:
                 self.dash_tg_stats.setText(
@@ -1729,7 +1894,7 @@ class MainWindow(QMainWindow):
         else:
             self.dash_tg_status.setText("● Остановлен")
             self.dash_tg_status.setStyleSheet("color: #FB7185; font-size: 12px; font-weight: 700;")
-            self.btn_tg_toggle.setText("Запустить TG-Мост")
+            self.btn_tg_toggle.setText("Запустить Мост")
             self.btn_tg_toggle.setObjectName("AccentBtn")
             err = st.get("last_error") or "Локальный MTProto-мост через WebSocket (без сторонних VPN)"
             self.dash_tg_stats.setText(err)
@@ -1890,6 +2055,7 @@ class MainWindow(QMainWindow):
 
         if info.get("has_update"):
             latest = info["latest"]
+            self._latest_version = latest
             self._latest_release_url = info["url"]
             self._latest_asset_url = info.get("asset_url", "")
             self.btn_sb_update.setText(f"Обновление v{latest}")
@@ -1900,9 +2066,10 @@ class MainWindow(QMainWindow):
             self.lbl_update_status.setStyleSheet("color: #FBBF24; font-size: 12px; font-weight: 700;")
             self.append_log(f"Найдено обновление Unfit Zapret: v{latest}")
 
+            can_auto_upd = core.IS_WINDOWS and self._latest_asset_url.lower().endswith(".exe") and core.is_compiled_binary()
             prompt_text = (
-                f"Вышла новая версия Unfit Zapret v{latest} (у вас v{core.APP_VERSION}).\n\nСкачать и установить сейчас?"
-                if self._latest_asset_url
+                f"Вышла новая версия Unfit Zapret v{latest} (у вас v{core.APP_VERSION}).\n\nСкачать, установить и автоматически перезапустить приложение?"
+                if can_auto_upd
                 else f"Вышла новая версия Unfit Zapret v{latest} (у вас v{core.APP_VERSION}).\n\nОткрыть страницу релиза на GitHub?"
             )
             ans = QMessageBox.question(
@@ -1921,32 +2088,88 @@ class MainWindow(QMainWindow):
                 self.lbl_update_status.setText(f"Версия v{core.APP_VERSION} ({info.get('error', 'офлайн')})")
 
     def _on_open_update_release(self):
-        if core.IS_WINDOWS and self._latest_asset_url.lower().endswith(".exe") and core.is_compiled_binary():
-            self.btn_sb_update.setEnabled(False)
+        if self._update_worker is not None:
+            self._update_worker.cancel()
             self.btn_open_release.setEnabled(False)
-            self.btn_open_release.setText("Скачивание...")
-            self.lbl_update_status.setText("Скачивание обновления с GitHub...")
+            self.btn_open_release.setText("Отмена...")
+            self.lbl_update_status.setText("Отмена скачивания...")
+            return
+
+        if core.IS_WINDOWS and self._latest_asset_url.lower().endswith(".exe") and core.is_compiled_binary():
+            self.nav_buttons[5].setChecked(True)
+            self._switch_page(5)
+            self.btn_sb_update.setEnabled(False)
+            self.btn_sb_update.setText("Загрузка 0%")
+            self.btn_open_release.setEnabled(True)
+            self.btn_open_release.setText("Отмена")
+            self.btn_check_update.setEnabled(False)
+            self.lbl_update_status.setText("Подключение к GitHub...")
             self.append_log("Скачивание обновления с GitHub...")
-            self._run_bg(core.download_and_apply_update, self._after_apply_update, self._latest_asset_url)
+            worker = UpdateWorker(self._latest_asset_url)
+            self._update_worker = worker
+            worker.progress.connect(self._on_update_progress, Qt.ConnectionType.QueuedConnection)
+            worker.finished_res.connect(self._after_apply_update, Qt.ConnectionType.QueuedConnection)
+            worker.start()
         else:
             QDesktopServices.openUrl(QUrl(self._latest_release_url))
 
-    def _after_apply_update(self, res):
+    def _on_update_progress(self, downloaded: int, total: int, text: str):
+        if self._update_worker is None or self._update_worker.cancel_event.is_set():
+            return
+        self.lbl_update_status.setText(text)
+        if total > 0:
+            pct = min(100, int(downloaded * 100 / total))
+            self.btn_sb_update.setText(f"Загрузка {pct}%")
+            self.btn_open_release.setText(f"Отмена ({pct}%)")
+        else:
+            mb = downloaded / (1024 * 1024)
+            self.btn_sb_update.setText(f"Загрузка {mb:.1f} МБ")
+            self.btn_open_release.setText("Отмена")
+
+    def _after_apply_update(self, ok: bool, msg: str):
+        worker = self._update_worker
+        self._update_worker = None
+        if worker is not None:
+            worker.deleteLater()
+
+        self.btn_check_update.setEnabled(True)
         self.btn_sb_update.setEnabled(True)
         self.btn_open_release.setEnabled(True)
-        ok_call, payload = res
-        if ok_call:
-            ok, msg = payload
-            if ok:
-                self.append_log(msg)
-                self.tg_proxy.stop()
-                core.stop_tg_proxy_detached()
-                self._force_quit = True
-                self.tray_icon.hide()
-                QApplication.quit()
-                return
-            QMessageBox.warning(self, "Обновление", f"{msg}\nОткроем страницу релиза в браузере.")
-        QDesktopServices.openUrl(QUrl(self._latest_release_url))
+
+        if ok:
+            self.lbl_update_status.setText("Обновление скачано! Перезапуск...")
+            self.btn_sb_update.setText("Перезапуск...")
+            self.btn_open_release.setEnabled(False)
+            self.append_log(msg)
+            self.tg_proxy.stop()
+            core.stop_tg_proxy_detached()
+            self._release_ipc_server()
+            self._force_quit = True
+            self.tray_icon.hide()
+            QApplication.quit()
+            return
+
+        ver_suffix = f" v{self._latest_version}" if self._latest_version else ""
+        self.btn_sb_update.setText(f"Обновление{ver_suffix}" if ver_suffix else "Обновление!")
+        self.btn_open_release.setText(f"Обновить до{ver_suffix}" if ver_suffix else "Обновить")
+
+        if "отменено" in msg.lower():
+            self.lbl_update_status.setText(
+                f"Скачивание отменено. Доступна версия{ver_suffix}" if ver_suffix else "Скачивание отменено."
+            )
+            self.append_log("Скачивание обновления отменено пользователем.")
+            return
+
+        self.lbl_update_status.setText(msg)
+        self.append_log(f"Ошибка обновления: {msg}")
+        ans = QMessageBox.question(
+            self,
+            "Ошибка обновления",
+            f"{msg}\n\nОткрыть страницу релиза в браузере, чтобы скачать вручную?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if ans == QMessageBox.StandardButton.Yes:
+            QDesktopServices.openUrl(QUrl(self._latest_release_url))
 
     def _auto_repair_autorun_if_needed(self):
         info = core.get_autorun_info()
@@ -2378,11 +2601,25 @@ class MainWindow(QMainWindow):
         self.raise_()
         self.activateWindow()
 
+    def _release_ipc_server(self):
+        srv = getattr(self, "_ipc_server", None)
+        self._ipc_server = None
+        if srv is not None:
+            try:
+                srv.close()
+            except Exception:
+                pass
+        try:
+            QLocalServer.removeServer(SINGLE_INSTANCE_KEY)
+        except Exception:
+            pass
+
     def _quit_app_keep_bypass(self):
         if self.tg_proxy.is_running():
             port = self.tg_proxy._port
             self.tg_proxy.stop()
             core.start_tg_proxy_detached(port)
+        self._release_ipc_server()
         self._force_quit = True
         self.tray_icon.hide()
         QApplication.quit()
@@ -2391,6 +2628,7 @@ class MainWindow(QMainWindow):
         core.kill_winws(timeout=2.0)
         self.tg_proxy.stop()
         core.stop_tg_proxy_detached()
+        self._release_ipc_server()
         self._force_quit = True
         self.tray_icon.hide()
         QApplication.quit()
@@ -2409,6 +2647,7 @@ class MainWindow(QMainWindow):
                     2000,
                 )
             return
+        self._release_ipc_server()
         self.tray_icon.hide()
         super().closeEvent(event)
 
@@ -2430,6 +2669,7 @@ def main():
         sys.exit(0)
 
     app = QApplication(sys.argv)
+    app.setStyle("Fusion")
     app.setApplicationName(APP_TITLE)
     app.setStyleSheet(APP_STYLESHEET)
 
@@ -2440,7 +2680,7 @@ def main():
     server = QLocalServer()
     server.listen(SINGLE_INSTANCE_KEY)
 
-    win = MainWindow()
+    win = MainWindow(ipc_server=server)
 
     def _on_new_conn():
         client = server.nextPendingConnection()

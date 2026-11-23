@@ -13,6 +13,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -33,7 +34,7 @@ if IS_WINDOWS:
     DETACHED_PROCESS = 0x00000008
     CREATE_NEW_PROCESS_GROUP = 0x00000200
     CREATE_BREAKAWAY_FROM_JOB = 0x01000000
-    BACKGROUND_FLAGS = CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    BACKGROUND_FLAGS = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
 else:
     CREATE_NO_WINDOW = 0
     DETACHED_PROCESS = 0
@@ -1787,7 +1788,270 @@ def check_github_update(timeout: int = 5) -> dict:
     return base_res
 
 
-def download_and_apply_update(asset_url: str) -> tuple[bool, str]:
+def _format_mb(n: int) -> str:
+    return f"{n / (1024 * 1024):.1f} МБ"
+
+
+def _format_speed(bps: float) -> str:
+    if bps >= 1024 * 1024:
+        return f"{bps / (1024 * 1024):.1f} МБ/с"
+    return f"{bps / 1024:.0f} КБ/с"
+
+
+def _format_progress(downloaded: int, total: int, elapsed: float) -> str:
+    speed = _format_speed(downloaded / max(0.1, elapsed))
+    if total > 0:
+        pct = min(100, int(downloaded * 100 / total))
+        return f"Скачивание: {_format_mb(downloaded)} / {_format_mb(total)} ({pct}%, {speed})"
+    return f"Скачивание: {_format_mb(downloaded)} ({speed})"
+
+
+def _validate_downloaded_exe(dst: Path, expected_size: int = 0) -> tuple[bool, str]:
+    if not dst.exists():
+        return False, "Файл обновления не сохранён"
+    size = dst.stat().st_size
+    if size < 1_000_000 or (expected_size > 0 and size != expected_size):
+        dst.unlink(missing_ok=True)
+        return False, "Скачанный файл неполный"
+    try:
+        with open(dst, "rb") as f:
+            head = f.read(2)
+    except OSError as e:
+        dst.unlink(missing_ok=True)
+        return False, f"Ошибка чтения файла: {e}"
+    if head != b"MZ":
+        dst.unlink(missing_ok=True)
+        return False, "Скачанный файл повреждён"
+    return True, ""
+
+
+def _download_update_urllib(
+    asset_url: str,
+    dst: Path,
+    progress_cb: Optional[Callable[[int, int, str], None]],
+    cancel_event: Optional[threading.Event],
+) -> tuple[bool, int, str]:
+    req = urllib.request.Request(asset_url, headers={"User-Agent": f"Unfit-Zapret/{APP_VERSION}"})
+    total_bytes = 0
+    downloaded = 0
+    started = time.monotonic()
+    last_emit = 0.0
+    window_start = started
+    window_bytes = 0
+    dst.unlink(missing_ok=True)
+
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw_len = (resp.headers.get("Content-Length") or "").strip()
+            if raw_len.isdigit():
+                total_bytes = int(raw_len)
+            with open(dst, "wb") as out:
+                while True:
+                    if cancel_event is not None and cancel_event.is_set():
+                        dst.unlink(missing_ok=True)
+                        return False, total_bytes, "cancelled"
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    clen = len(chunk)
+                    downloaded += clen
+                    window_bytes += clen
+                    now = time.monotonic()
+                    if now - started > 180.0:
+                        dst.unlink(missing_ok=True)
+                        return False, total_bytes, "Превышено время ожидания загрузки (180 сек)"
+                    win_dt = now - window_start
+                    if win_dt >= 20.0:
+                        if window_bytes / win_dt < 4096.0:
+                            dst.unlink(missing_ok=True)
+                            return False, total_bytes, "Слишком низкая скорость загрузки (возможно замедление GitHub)"
+                        window_start = now
+                        window_bytes = 0
+                    if progress_cb and (now - last_emit >= 0.2 or (total_bytes > 0 and downloaded >= total_bytes)):
+                        last_emit = now
+                        progress_cb(downloaded, total_bytes, _format_progress(downloaded, total_bytes, now - started))
+    except Exception as e:
+        dst.unlink(missing_ok=True)
+        if cancel_event is not None and cancel_event.is_set():
+            return False, total_bytes, "cancelled"
+        return False, total_bytes, str(e)
+
+    if cancel_event is not None and cancel_event.is_set():
+        dst.unlink(missing_ok=True)
+        return False, total_bytes, "cancelled"
+
+    ok, err = _validate_downloaded_exe(dst, total_bytes)
+    if not ok:
+        return False, total_bytes, err
+    if progress_cb:
+        final_total = total_bytes or downloaded
+        progress_cb(downloaded, final_total, _format_progress(downloaded, final_total, time.monotonic() - started))
+    return True, total_bytes, ""
+
+
+def _download_update_curl(
+    asset_url: str,
+    dst: Path,
+    total_hint: int,
+    progress_cb: Optional[Callable[[int, int, str], None]],
+    cancel_event: Optional[threading.Event],
+) -> tuple[bool, str]:
+    dst.unlink(missing_ok=True)
+    cmd = [
+        CURL_EXE,
+        "-fL",
+        "--silent",
+        "--show-error",
+        "--connect-timeout", "15",
+        "--speed-limit", "4096",
+        "--speed-time", "20",
+        "--max-time", "180",
+        "--retry", "1",
+        "-A", f"Unfit-Zapret/{APP_VERSION}",
+        "-o", str(dst),
+        asset_url,
+    ]
+    started = time.monotonic()
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            creationflags=CREATE_NO_WINDOW,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+    except Exception as e:
+        dst.unlink(missing_ok=True)
+        return False, f"curl не запущен: {e}"
+
+    try:
+        while proc.poll() is None:
+            if cancel_event is not None and cancel_event.is_set():
+                proc.kill()
+                try:
+                    proc.wait(timeout=3)
+                except Exception:
+                    pass
+                dst.unlink(missing_ok=True)
+                return False, "cancelled"
+            if progress_cb and dst.exists():
+                try:
+                    cur_size = dst.stat().st_size
+                except OSError:
+                    cur_size = 0
+                if cur_size > 0:
+                    progress_cb(cur_size, total_hint, _format_progress(cur_size, total_hint, time.monotonic() - started))
+            time.sleep(0.25)
+
+        _, err_bytes = proc.communicate(timeout=5)
+    except Exception as e:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        dst.unlink(missing_ok=True)
+        return False, f"Ошибка curl: {e}"
+
+    if cancel_event is not None and cancel_event.is_set():
+        dst.unlink(missing_ok=True)
+        return False, "cancelled"
+
+    if proc.returncode != 0:
+        err_txt = ""
+        if err_bytes:
+            err_txt = err_bytes.decode("utf-8", errors="ignore").strip()
+            if not err_txt:
+                err_txt = err_bytes.decode("cp866", errors="ignore").strip()
+        dst.unlink(missing_ok=True)
+        return False, f"curl ({proc.returncode}): {err_txt or 'ошибка загрузки'}"
+
+    ok, err = _validate_downloaded_exe(dst, total_hint)
+    if not ok:
+        return False, err
+    size = dst.stat().st_size
+    if progress_cb:
+        final_total = total_hint or size
+        progress_cb(size, final_total, _format_progress(size, final_total, time.monotonic() - started))
+    return True, ""
+
+
+def _escape_bat_val(val: str) -> str:
+    return val.replace("%", "%%")
+
+
+def _build_update_bat(new_exe: Path, target_exe: Path, child_pid: int, parent_pid: Optional[int]) -> str:
+    log_path = _escape_bat_val(str(Path(tempfile.gettempdir()) / "unfit_zapret_update.log"))
+    new_s = _escape_bat_val(str(new_exe))
+    target_s = _escape_bat_val(str(target_exe))
+    target_dir_s = _escape_bat_val(str(target_exe.parent))
+    ping_cmd = r"%SystemRoot%\System32\ping.exe -n 2 127.0.0.1 >nul"
+
+    lines = [
+        "@echo off",
+        "chcp 65001 >nul",
+        "setlocal EnableExtensions",
+        f'set "NEW_EXE={new_s}"',
+        f'set "TARGET_EXE={target_s}"',
+        f'set "TARGET_DIR={target_dir_s}"',
+        f'set "LOG_FILE={log_path}"',
+        'echo [%DATE% %TIME%] Updater started > "%LOG_FILE%"',
+    ]
+
+    def _append_pid_wait(tag: str, pid: int, next_label: str) -> None:
+        lines.extend([
+            f"set /a wait_{tag}=0",
+            f":wait_{tag}_loop",
+            'set "ALIVE="',
+            f'for /f "tokens=2 delims=," %%P in (\'%SystemRoot%\\System32\\tasklist.exe /nh /fo csv /fi "PID eq {pid}" 2^>nul\') do if "%%~P"=="{pid}" set "ALIVE=1"',
+            f"if not defined ALIVE goto {next_label}",
+            f"set /a wait_{tag}+=1",
+            f"if %wait_{tag}% GEQ 30 goto {next_label}",
+            ping_cmd,
+            f"goto wait_{tag}_loop",
+        ])
+
+    has_parent = parent_pid is not None and parent_pid != child_pid
+    _append_pid_wait("child", child_pid, "wait_parent_init" if has_parent else "after_wait")
+    if has_parent:
+        lines.append(":wait_parent_init")
+        _append_pid_wait("parent", parent_pid, "after_wait")
+
+    lines.extend([
+        ":after_wait",
+        ping_cmd,
+        "set /a tries=0",
+        ":replace_loop",
+        'move /y "%NEW_EXE%" "%TARGET_EXE%" >nul 2>&1',
+        'if not exist "%NEW_EXE%" if exist "%TARGET_EXE%" goto launch_new',
+        'copy /y "%NEW_EXE%" "%TARGET_EXE%" >nul 2>&1',
+        "if not errorlevel 1 (",
+        '    del /f /q "%NEW_EXE%" >nul 2>&1',
+        "    goto launch_new",
+        ")",
+        "set /a tries+=1",
+        "if %tries% GEQ 30 goto replace_fail",
+        ping_cmd,
+        "goto replace_loop",
+        ":launch_new",
+        'echo [%DATE% %TIME%] Replaced OK >> "%LOG_FILE%"',
+        'cd /d "%TARGET_DIR%"',
+        'start "" "%TARGET_EXE%"',
+        ping_cmd,
+        '(goto) 2>nul & del /f /q "%~f0" >nul 2>&1',
+        ":replace_fail",
+        'echo [%DATE% %TIME%] Replace failed after 30 attempts >> "%LOG_FILE%"',
+        'if exist "%TARGET_EXE%" start "" "%TARGET_EXE%"',
+        '(goto) 2>nul & del /f /q "%~f0" >nul 2>&1',
+    ])
+    return "\r\n".join(lines) + "\r\n"
+
+
+def download_and_apply_update(
+    asset_url: str,
+    progress_cb: Optional[Callable[[int, int, str], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
+) -> tuple[bool, str]:
     if not IS_WINDOWS:
         return False, "На Linux обновитесь через архив со страницы релиза"
     if not asset_url or not asset_url.lower().endswith(".exe"):
@@ -1797,40 +2061,46 @@ def download_and_apply_update(asset_url: str) -> tuple[bool, str]:
         return False, "Автообновление доступно только в скомпилированном .exe"
 
     target_exe = get_real_executable()
-    new_exe = target_exe.with_suffix(".exe.new")
+    new_exe = target_exe.with_name(target_exe.name + ".new")
 
+    # Проверяем права записи в папку программы до начала скачивания
+    probe_file = target_exe.with_name(f".unfit_upd_probe_{os.getpid()}.tmp")
     try:
-        req = urllib.request.Request(asset_url, headers={"User-Agent": f"Unfit-Zapret/{APP_VERSION}"})
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            data = resp.read()
-        if len(data) < 1_000_000 or not data.startswith(b"MZ"):
-            return False, "Скачанный файл повреждён"
-        new_exe.write_bytes(data)
-    except Exception as e:
-        return False, f"Ошибка скачивания: {e}"
+        new_exe.unlink(missing_ok=True)
+        probe_file.write_bytes(b"ok")
+        probe_file.unlink(missing_ok=True)
+    except OSError as e:
+        return False, f"Нет прав на запись в папку {target_exe.parent}: {e}"
+
+    ok, total_hint, err_msg = _download_update_urllib(asset_url, new_exe, progress_cb, cancel_event)
+    if not ok:
+        if err_msg == "cancelled":
+            return False, "Скачивание отменено"
+        if progress_cb:
+            progress_cb(0, total_hint, "Повтор через системный curl...")
+        ok_curl, err_curl = _download_update_curl(asset_url, new_exe, total_hint, progress_cb, cancel_event)
+        if not ok_curl:
+            new_exe.unlink(missing_ok=True)
+            if err_curl == "cancelled":
+                return False, "Скачивание отменено"
+            last_err = err_curl or err_msg
+            return False, f"Ошибка скачивания: {last_err}. Попробуйте включить обход или скачать вручную."
+
+    raw_parent = (os.environ.get("NUITKA_ONEFILE_PARENT") or "").strip()
+    parent_pid = int(raw_parent) if raw_parent.isdigit() and int(raw_parent) != os.getpid() else None
 
     bat_path = Path(tempfile.gettempdir()) / "unfit_zapret_update.bat"
-    pid = os.getpid()
-    bat_content = (
-        "@echo off\r\n"
-        f':waitloop\r\ntasklist /fi "PID eq {pid}" | find "{pid}" >nul\r\n'
-        "if not errorlevel 1 (\r\n"
-        "    timeout /t 1 /nobreak >nul\r\n"
-        "    goto waitloop\r\n"
-        ")\r\n"
-        f'move /y "{new_exe}" "{target_exe}" >nul\r\n'
-        f'start "" "{target_exe}"\r\n'
-        'del "%~f0"\r\n'
-    )
+    bat_content = _build_update_bat(new_exe, target_exe, os.getpid(), parent_pid)
     try:
-        bat_path.write_text(bat_content, encoding="cp1251")
+        bat_path.write_text(bat_content, encoding="utf-8")
         subprocess.Popen(
             ["cmd.exe", "/c", str(bat_path)],
-            creationflags=CREATE_NO_WINDOW | DETACHED_PROCESS,
+            creationflags=CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            close_fds=True,
         )
-        return True, "Обновление скачано, перезапуск..."
+        return True, "Обновление скачано! Выполняется замена и автоперезапуск..."
     except Exception as e:
         return False, f"Не удалось запустить обновление: {e}"
