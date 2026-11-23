@@ -20,7 +20,12 @@ if "--stop" in sys.argv[1:]:
         zapret_core.relaunch_as_admin()
         sys.exit(0)
     zapret_core.kill_winws()
+    zapret_core.stop_tg_proxy_detached()
     sys.exit(0)
+
+if "--tg-proxy" in sys.argv[1:]:
+    import tg_proxy
+    sys.exit(tg_proxy.run_standalone_from_config())
 
 import subprocess
 import threading
@@ -73,6 +78,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QScrollArea,
+    QSpinBox,
     QStackedWidget,
     QSystemTrayIcon,
     QTableWidget,
@@ -82,6 +88,7 @@ from PyQt6.QtWidgets import (
 )
 
 import zapret_core as core
+from tg_proxy import TgProxyService
 
 
 APP_TITLE = f"{core.APP_NAME} v{core.APP_VERSION}"
@@ -445,7 +452,7 @@ class SimpleWorker(QObject):
 
 class AutoTuneWorker(QObject):
     step_started = pyqtSignal(int, int, str)
-    step_result = pyqtSignal(int, bool, bool, str)
+    step_result = pyqtSignal(int, bool, bool, bool, str)
     finished_all = pyqtSignal(list, bool)
     log_msg = pyqtSignal(str)
 
@@ -485,7 +492,7 @@ class AutoTuneWorker(QObject):
                     aborted_by_error = True
                     return
 
-            test_cfg = {"fake_sni": "www.google.com", "udp_mode": "narrow"}
+            test_cfg = {"fake_sni": "www.sferum.ru", "udp_mode": "narrow", "tg_dpi_bypass": True}
             total = len(core.STRATEGIES)
 
             for idx, item in enumerate(core.STRATEGIES, 1):
@@ -514,8 +521,8 @@ class AutoTuneWorker(QObject):
                     )
                 except Exception as e:
                     self.log_msg.emit(f"  [Ошибка запуска] {e}")
-                    results.append({"index": idx, "strategy": strat, "yt": False, "ds": False, "note": "Ошибка запуска"})
-                    self.step_result.emit(idx, False, False, "Ошибка запуска")
+                    results.append({"index": idx, "strategy": strat, "yt": False, "ds": False, "tg": False, "note": "Ошибка запуска"})
+                    self.step_result.emit(idx, False, False, False, "Ошибка запуска")
                     continue
 
                 aborted = False
@@ -545,19 +552,21 @@ class AutoTuneWorker(QObject):
                         pass
                     note = "Упал"
                     self.log_msg.emit(f"  [{engine_name} упал] {err_txt[:100] if err_txt else 'без текста ошибки'}")
-                    results.append({"index": idx, "strategy": strat, "yt": False, "ds": False, "note": note})
-                    self.step_result.emit(idx, False, False, note)
+                    results.append({"index": idx, "strategy": strat, "yt": False, "ds": False, "tg": False, "note": note})
+                    self.step_result.emit(idx, False, False, False, note)
                     core.cleanup_windivert()
                     if core.IS_LINUX:
                         core.setup_linux_firewall("443,19294-19344,50000-50100")
                     time.sleep(0.3)
                     continue
 
-                with ThreadPoolExecutor(max_workers=2) as pool:
+                with ThreadPoolExecutor(max_workers=3) as pool:
                     f_yt = pool.submit(core.check_url, "https://www.youtube.com", 4)
                     f_ds = pool.submit(core.check_url, "https://discord.com/api/v10/gateway", 4)
+                    f_tg = pool.submit(core.check_url, "https://t.me", 4)
                     yt_ok, yt_code = f_yt.result()
                     ds_ok, ds_code = f_ds.result()
+                    tg_ok, tg_code = f_tg.result()
 
                 try:
                     proc.kill()
@@ -568,18 +577,23 @@ class AutoTuneWorker(QObject):
                 if core.IS_LINUX and idx < total and not self._stop_requested:
                     core.setup_linux_firewall("443,19294-19344,50000-50100")
 
-                if yt_ok and ds_ok:
+                ok_cnt = int(yt_ok) + int(ds_ok) + int(tg_ok)
+                if ok_cnt == 3:
+                    note = "Идеально"
+                elif yt_ok and ds_ok:
                     note = "Отлично"
-                elif yt_ok or ds_ok:
+                elif ok_cnt == 2:
+                    note = "Хорошо"
+                elif ok_cnt == 1:
                     note = "Частично"
                 else:
                     note = "Не пробило"
 
                 self.log_msg.emit(
-                    f"  -> YouTube: {'OK' if yt_ok else 'FAIL'} ({yt_code}) | Discord: {'OK' if ds_ok else 'FAIL'} ({ds_code})"
+                    f"  -> YouTube: {'OK' if yt_ok else 'FAIL'} ({yt_code}) | Discord: {'OK' if ds_ok else 'FAIL'} ({ds_code}) | Telegram: {'OK' if tg_ok else 'FAIL'} ({tg_code})"
                 )
-                results.append({"index": idx, "strategy": strat, "yt": yt_ok, "ds": ds_ok, "note": note})
-                self.step_result.emit(idx, yt_ok, ds_ok, note)
+                results.append({"index": idx, "strategy": strat, "yt": yt_ok, "ds": ds_ok, "tg": tg_ok, "note": note})
+                self.step_result.emit(idx, yt_ok, ds_ok, tg_ok, note)
         except Exception as e:
             aborted_by_error = True
             self.log_msg.emit(f"[ОШИБКА] Сбой авто-тюнинга: {e}")
@@ -776,7 +790,7 @@ QPushButton#SecondaryBtn:disabled {
     border-color: #2B1734;
 }
 
-QComboBox, QLineEdit {
+QComboBox, QLineEdit, QSpinBox {
     background-color: rgba(12, 8, 19, 230);
     color: #F8F5FF;
     border: 1px solid #43204E;
@@ -784,7 +798,7 @@ QComboBox, QLineEdit {
     padding: 8px 12px;
     font-size: 13px;
 }
-QComboBox:focus, QLineEdit:focus {
+QComboBox:focus, QLineEdit:focus, QSpinBox:focus {
     border-color: #FF1E42;
 }
 QComboBox::drop-down {
@@ -897,6 +911,7 @@ class MainWindow(QMainWindow):
         self._is_running: bool = False
         self._tray_notified_once: bool = False
         self._force_quit: bool = False
+        self.tg_proxy = TgProxyService()
 
         self.cursors = create_demon_cursors()
         self.icon_idle = create_demon_crest_icon(active=False, size=96)
@@ -904,10 +919,18 @@ class MainWindow(QMainWindow):
         self.setWindowIcon(self.icon_idle)
 
         core.ensure_files_exist()
+        cfg_init = core.load_config()
+        if not cfg_init.get("tg_proxy_secret"):
+            core.ensure_tg_secret(cfg_init)
+            core.save_config(cfg_init)
+
         self._build_ui()
         self._apply_theme_cursors(self)
         self._setup_tray()
         self._setup_timers()
+
+        if cfg_init.get("tg_proxy_enabled", True):
+            self._ensure_tg_proxy_started(cfg_init)
 
         self.append_log(f"Unfit Zapret v{core.APP_VERSION} запущен. Рабочая папка: {core.WORK_DIR}")
         self.refresh_all_state()
@@ -934,6 +957,8 @@ class MainWindow(QMainWindow):
             cmb.setCursor(self.cursors["pointer"])
             if cmb.view():
                 cmb.view().setCursor(self.cursors["pointer"])
+        for sb in widget.findChildren(QSpinBox):
+            sb.setCursor(self.cursors["pointer"])
         for le in widget.findChildren(QLineEdit):
             le.setCursor(self.cursors["ibeam"])
         for te in widget.findChildren(QPlainTextEdit):
@@ -1036,10 +1061,13 @@ class MainWindow(QMainWindow):
             self._refresh_diagnostics()
 
     def _build_dashboard_page(self) -> QWidget:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
         page = QWidget()
         lay = QVBoxLayout(page)
         lay.setContentsMargins(24, 22, 24, 20)
-        lay.setSpacing(16)
+        lay.setSpacing(14)
 
         header = QVBoxLayout()
         header.setSpacing(2)
@@ -1125,6 +1153,35 @@ class MainWindow(QMainWindow):
 
         lay.addLayout(mid_row)
 
+        tg_card = QFrame(objectName="Card")
+        tg_lay = QHBoxLayout(tg_card)
+        tg_lay.setContentsMargins(18, 14, 18, 14)
+        tg_lay.setSpacing(12)
+        tg_left = QVBoxLayout()
+        tg_left.setSpacing(3)
+        tg_left.addWidget(QLabel("Telegram WS-Мост (MTProto Proxy)", objectName="SectionTitle"))
+        self.dash_tg_status = QLabel("● Остановлен")
+        self.dash_tg_status.setStyleSheet("color: #FB7185; font-size: 12px; font-weight: 700;")
+        self.dash_tg_stats = QLabel("Трафик: WS 0 | CF 0 | ↑ 0 B | ↓ 0 B")
+        self.dash_tg_stats.setObjectName("Muted")
+        tg_left.addWidget(self.dash_tg_status)
+        tg_left.addWidget(self.dash_tg_stats)
+        tg_lay.addLayout(tg_left, 1)
+
+        tg_btns = QHBoxLayout()
+        tg_btns.setSpacing(8)
+        self.btn_tg_toggle = QPushButton("Запустить TG-Мост", objectName="AccentBtn")
+        self.btn_tg_toggle.clicked.connect(self._on_toggle_tg_proxy)
+        self.btn_tg_open = QPushButton("Открыть в Telegram", objectName="PrimaryStart")
+        self.btn_tg_open.clicked.connect(self._on_open_tg_link)
+        self.btn_tg_copy = QPushButton("Копировать ссылку", objectName="SecondaryBtn")
+        self.btn_tg_copy.clicked.connect(self._on_copy_tg_link)
+        tg_btns.addWidget(self.btn_tg_toggle)
+        tg_btns.addWidget(self.btn_tg_open)
+        tg_btns.addWidget(self.btn_tg_copy)
+        tg_lay.addLayout(tg_btns)
+        lay.addWidget(tg_card)
+
         test_card = QFrame(objectName="Card")
         test_lay = QVBoxLayout(test_card)
         test_lay.setContentsMargins(18, 16, 18, 16)
@@ -1164,7 +1221,8 @@ class MainWindow(QMainWindow):
         test_lay.addLayout(sites_grid)
         lay.addWidget(test_card)
         lay.addStretch()
-        return page
+        scroll.setWidget(page)
+        return scroll
 
     def _build_autotune_page(self) -> QWidget:
         page = QWidget()
@@ -1177,7 +1235,10 @@ class MainWindow(QMainWindow):
         h_text.setSpacing(2)
         h_text.addWidget(QLabel("Авто-Тюнинг стратегий", objectName="PageTitle"))
         h_text.addWidget(
-            QLabel("Автоматический перебор всех 11 стратегий для поиска лучшего обхода у вашего провайдера", objectName="PageSub")
+            QLabel(
+                f"Автоматический перебор всех {len(core.STRATEGIES)} стратегий 2026 года (YouTube, Discord, Telegram)",
+                objectName="PageSub",
+            )
         )
         header.addLayout(h_text, 1)
 
@@ -1205,8 +1266,8 @@ class MainWindow(QMainWindow):
         prog_lay.addWidget(self.tune_progress)
         lay.addWidget(prog_card)
 
-        self.tune_table = QTableWidget(len(core.STRATEGIES), 5)
-        self.tune_table.setHorizontalHeaderLabels(["#", "Стратегия", "YouTube", "Discord", "Результат"])
+        self.tune_table = QTableWidget(len(core.STRATEGIES), 6)
+        self.tune_table.setHorizontalHeaderLabels(["#", "Стратегия", "YouTube", "Discord", "Telegram", "Результат"])
         self.tune_table.setAlternatingRowColors(True)
         self.tune_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.tune_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -1218,13 +1279,14 @@ class MainWindow(QMainWindow):
         hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
 
         for i, item in enumerate(core.STRATEGIES):
             num_item = QTableWidgetItem(f"#{i + 1}")
             num_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.tune_table.setItem(i, 0, num_item)
             self.tune_table.setItem(i, 1, QTableWidgetItem(f"{item['name']} - {item['desc']}"))
-            for col in (2, 3, 4):
+            for col in (2, 3, 4, 5):
                 cell = QTableWidgetItem("-")
                 cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.tune_table.setItem(i, col, cell)
@@ -1315,6 +1377,26 @@ class MainWindow(QMainWindow):
         ui_lay.addWidget(self.chk_minimize_tray)
         scroll_lay.addWidget(ui_card)
 
+        tg_set_card = QFrame(objectName="Card")
+        tg_set_lay = QVBoxLayout(tg_set_card)
+        tg_set_lay.setContentsMargins(18, 16, 18, 16)
+        tg_set_lay.setSpacing(8)
+        tg_set_lay.addWidget(QLabel("5. Обход Telegram (DPI + WS-Мост)", objectName="SectionTitle"))
+        self.chk_tg_dpi = QCheckBox("Включить DPI-обход для Telegram (Web, звонки и прямые IP дата-центров)")
+        self.chk_tg_proxy = QCheckBox("Автозапуск встроенного Telegram WS-Моста (MTProto прокси 127.0.0.1)")
+        port_row = QHBoxLayout()
+        port_row.setSpacing(10)
+        port_row.addWidget(QLabel("Локальный порт WS-Моста:"))
+        self.spin_tg_port = QSpinBox()
+        self.spin_tg_port.setRange(1024, 65535)
+        self.spin_tg_port.setFixedWidth(120)
+        port_row.addWidget(self.spin_tg_port)
+        port_row.addStretch()
+        tg_set_lay.addWidget(self.chk_tg_dpi)
+        tg_set_lay.addWidget(self.chk_tg_proxy)
+        tg_set_lay.addLayout(port_row)
+        scroll_lay.addWidget(tg_set_card)
+
         scroll_lay.addStretch()
         scroll.setWidget(scroll_content)
         lay.addWidget(scroll, 1)
@@ -1368,6 +1450,8 @@ class MainWindow(QMainWindow):
         self.combo_list_file.addItem("ipset-exclude-user.txt (Исключённые IP)", "ipset-exclude-user.txt")
         self.combo_list_file.addItem("list-exclude-user.txt (Исключённые домены)", "list-exclude-user.txt")
         self.combo_list_file.addItem("list-general-user.txt (Дополнительные домены для обхода)", "list-general-user.txt")
+        self.combo_list_file.addItem("list-telegram.txt (Домены Telegram)", "list-telegram.txt")
+        self.combo_list_file.addItem("ipset-telegram.txt (Подсети Telegram)", "ipset-telegram.txt")
         self.combo_list_file.currentIndexChanged.connect(self._load_exclusion_editor)
         top_ed.addWidget(self.combo_list_file, 1)
 
@@ -1572,6 +1656,8 @@ class MainWindow(QMainWindow):
         self.tray_act_toggle.triggered.connect(self._on_toggle_bypass)
         act_restart = menu.addAction("Перезапустить обход")
         act_restart.triggered.connect(self._on_restart_bypass)
+        act_tg_connect = menu.addAction("Подключить прокси в Telegram")
+        act_tg_connect.triggered.connect(self._on_open_tg_link)
         menu.addSeparator()
         act_exit_only = menu.addAction("Выйти (оставить обход работать)")
         act_exit_only.triggered.connect(self._quit_app_keep_bypass)
@@ -1599,6 +1685,101 @@ class MainWindow(QMainWindow):
         if running != self._is_running:
             self._is_running = running
             self._apply_running_visuals(running)
+        self._refresh_tg_ui()
+
+    @staticmethod
+    def _format_bytes(n: int) -> str:
+        val = float(n)
+        for unit in ("B", "KB", "MB", "GB"):
+            if abs(val) < 1024:
+                return f"{val:.0f} {unit}" if unit == "B" else f"{val:.1f} {unit}"
+            val /= 1024
+        return f"{val:.1f} TB"
+
+    def _ensure_tg_proxy_started(self, cfg: dict) -> tuple[bool, str]:
+        port = int(cfg.get("tg_proxy_port", 1443) or 1443)
+        secret = core.ensure_tg_secret(cfg)
+        self.tg_proxy._host = "127.0.0.1"
+        self.tg_proxy._port = port
+        self.tg_proxy._secret_hex = secret
+        if self.tg_proxy.is_running() or core.is_tg_proxy_port_open(port):
+            return True, f"Telegram WS-Мост уже работает на 127.0.0.1:{port}"
+        return self.tg_proxy.start("127.0.0.1", port, secret)
+
+    def _refresh_tg_ui(self):
+        cfg = core.load_config()
+        port = int(cfg.get("tg_proxy_port", 1443) or 1443)
+        st = self.tg_proxy.get_stats()
+        in_proc = st["running"]
+        ext_up = (not in_proc) and core.is_tg_proxy_port_open(port)
+        active = in_proc or ext_up
+        if active:
+            mode_note = f"127.0.0.1:{st['port'] if in_proc else port}"
+            self.dash_tg_status.setText(f"● Активен ({mode_note})")
+            self.dash_tg_status.setStyleSheet("color: #34D399; font-size: 12px; font-weight: 700;")
+            self.btn_tg_toggle.setText("Остановить TG-Мост")
+            self.btn_tg_toggle.setObjectName("DangerStop")
+            if in_proc:
+                self.dash_tg_stats.setText(
+                    f"Трафик: WS {st['ws']} | CF {st['cf']} | TCP {st['tcp']} | "
+                    f"↑ {self._format_bytes(st['bytes_up'])} | ↓ {self._format_bytes(st['bytes_down'])}"
+                )
+            else:
+                self.dash_tg_stats.setText("Запущен в фоне (служба автозапуска)")
+        else:
+            self.dash_tg_status.setText("● Остановлен")
+            self.dash_tg_status.setStyleSheet("color: #FB7185; font-size: 12px; font-weight: 700;")
+            self.btn_tg_toggle.setText("Запустить TG-Мост")
+            self.btn_tg_toggle.setObjectName("AccentBtn")
+            err = st.get("last_error") or "Локальный MTProto-мост через WebSocket (без сторонних VPN)"
+            self.dash_tg_stats.setText(err)
+        self.btn_tg_toggle.style().unpolish(self.btn_tg_toggle)
+        self.btn_tg_toggle.style().polish(self.btn_tg_toggle)
+
+    def _on_toggle_tg_proxy(self):
+        cfg = core.load_config()
+        port = int(cfg.get("tg_proxy_port", 1443) or 1443)
+        if self.tg_proxy.is_running() or core.is_tg_proxy_port_open(port):
+            self.tg_proxy.stop()
+            core.stop_tg_proxy_detached()
+            self.append_log("Telegram WS-Мост остановлен.")
+        else:
+            if not cfg.get("tg_proxy_secret"):
+                core.ensure_tg_secret(cfg)
+                core.save_config(cfg)
+            ok, msg = self._ensure_tg_proxy_started(cfg)
+            self.append_log(msg)
+            if not ok:
+                QMessageBox.warning(self, "Telegram WS-Мост", msg)
+        self._refresh_tg_ui()
+
+    def _on_open_tg_link(self):
+        cfg = core.load_config()
+        if not cfg.get("tg_proxy_secret"):
+            core.ensure_tg_secret(cfg)
+            core.save_config(cfg)
+        ok, msg = self._ensure_tg_proxy_started(cfg)
+        if not ok:
+            QMessageBox.warning(self, "Telegram WS-Мост", msg)
+            return
+        self._refresh_tg_ui()
+        link = self.tg_proxy.get_tg_link()
+        if link:
+            QDesktopServices.openUrl(QUrl(link))
+            self.append_log("Открыта ссылка подключения прокси в Telegram Desktop.")
+
+    def _on_copy_tg_link(self):
+        cfg = core.load_config()
+        secret = core.ensure_tg_secret(cfg)
+        if cfg.get("tg_proxy_secret") == secret:
+            core.save_config(cfg)
+        port = int(cfg.get("tg_proxy_port", 1443) or 1443)
+        link = f"tg://proxy?server=127.0.0.1&port={port}&secret=dd{secret}"
+        cb = QApplication.clipboard()
+        if cb is not None:
+            cb.setText(link)
+        self.append_log("Ссылка MTProto-прокси скопирована в буфер обмена.")
+        QMessageBox.information(self, "Telegram WS-Мост", f"Ссылка скопирована:\n{link}")
 
     def _apply_running_visuals(self, running: bool):
         icon = self.icon_active if running else self.icon_idle
@@ -1649,8 +1830,9 @@ class MainWindow(QMainWindow):
 
         self.dash_cfg_strat.setText(f"Стратегия: {strat_label}")
         self.dash_cfg_udp.setText(f"Режим UDP: {cfg.get('udp_mode', 'narrow').upper()}")
-        self.dash_cfg_sni.setText(f"Fake SNI: {cfg.get('fake_sni', 'www.google.com')}")
+        self.dash_cfg_sni.setText(f"Fake SNI: {cfg.get('fake_sni', 'www.sferum.ru')}")
         self.sb_strat_lbl.setText(f"Стратегия: #{idx if idx else '?'}")
+        self._refresh_tg_ui()
 
         info = core.get_autorun_info()
         if info["enabled"]:
@@ -1757,7 +1939,11 @@ class MainWindow(QMainWindow):
             ok, msg = payload
             if ok:
                 self.append_log(msg)
-                self._quit_app_keep_bypass()
+                self.tg_proxy.stop()
+                core.stop_tg_proxy_detached()
+                self._force_quit = True
+                self.tray_icon.hide()
+                QApplication.quit()
                 return
             QMessageBox.warning(self, "Обновление", f"{msg}\nОткроем страницу релиза в браузере.")
         QDesktopServices.openUrl(QUrl(self._latest_release_url))
@@ -1886,7 +2072,7 @@ class MainWindow(QMainWindow):
         self.tune_progress.setValue(0)
 
         for row in range(self.tune_table.rowCount()):
-            for col in (2, 3, 4):
+            for col in (2, 3, 4, 5):
                 it = self.tune_table.item(row, col)
                 it.setText("-")
                 it.setForeground(QColor("#A79AB8"))
@@ -1909,7 +2095,7 @@ class MainWindow(QMainWindow):
         self.tune_progress.setValue(idx - 1)
         self.tune_table.selectRow(idx - 1)
 
-    def _on_tune_step_result(self, idx: int, yt_ok: bool, ds_ok: bool, note: str):
+    def _on_tune_step_result(self, idx: int, yt_ok: bool, ds_ok: bool, tg_ok: bool, note: str):
         row = idx - 1
         self.tune_progress.setValue(idx)
 
@@ -1921,11 +2107,16 @@ class MainWindow(QMainWindow):
         ds_item.setText("OK" if ds_ok else "FAIL")
         ds_item.setForeground(QColor("#34D399" if ds_ok else "#FB7185"))
 
-        st_item = self.tune_table.item(row, 4)
+        tg_item = self.tune_table.item(row, 4)
+        tg_item.setText("OK" if tg_ok else "FAIL")
+        tg_item.setForeground(QColor("#34D399" if tg_ok else "#FB7185"))
+
+        st_item = self.tune_table.item(row, 5)
         st_item.setText(note)
-        if yt_ok and ds_ok:
+        ok_cnt = int(yt_ok) + int(ds_ok) + int(tg_ok)
+        if ok_cnt == 3 or (yt_ok and ds_ok):
             st_item.setForeground(QColor("#FBBF24"))
-        elif yt_ok or ds_ok:
+        elif ok_cnt >= 1:
             st_item.setForeground(QColor("#C084FC"))
         else:
             st_item.setForeground(QColor("#FB7185"))
@@ -1937,16 +2128,26 @@ class MainWindow(QMainWindow):
 
         best_idx = None
         for r in results:
-            if r["yt"] and r["ds"]:
+            if r["yt"] and r["ds"] and r.get("tg"):
                 best_idx = r["index"]
                 break
         if best_idx is None:
             for r in results:
-                if r["yt"]:
+                if r["yt"] and r["ds"]:
+                    best_idx = r["index"]
+                    break
+        if best_idx is None:
+            for r in results:
+                if (int(r["yt"]) + int(r["ds"]) + int(bool(r.get("tg")))) >= 2:
+                    best_idx = r["index"]
+                    break
+        if best_idx is None:
+            for r in results:
+                if r["yt"] or r.get("tg"):
                     best_idx = r["index"]
                     break
         if best_idx is None and results:
-            best_idx = min(3, len(results))
+            best_idx = 1
 
         if best_idx is not None:
             self.tune_table.selectRow(best_idx - 1)
@@ -2002,7 +2203,7 @@ class MainWindow(QMainWindow):
         else:
             self.rb_udp_narrow.setChecked(True)
 
-        sni = cfg.get("fake_sni", "www.google.com")
+        sni = cfg.get("fake_sni", "www.sferum.ru")
         found_sni = self.combo_sni.findData(sni)
         if found_sni >= 0:
             self.combo_sni.setCurrentIndex(found_sni)
@@ -2013,6 +2214,9 @@ class MainWindow(QMainWindow):
             self.edit_custom_sni.setVisible(True)
 
         self.chk_minimize_tray.setChecked(cfg.get("minimize_to_tray", True))
+        self.chk_tg_dpi.setChecked(cfg.get("tg_dpi_bypass", True))
+        self.chk_tg_proxy.setChecked(cfg.get("tg_proxy_enabled", True))
+        self.spin_tg_port.setValue(int(cfg.get("tg_proxy_port", 1443) or 1443))
 
     def _on_sni_combo_changed(self):
         self.edit_custom_sni.setVisible(self.combo_sni.currentData() == "__custom__")
@@ -2027,19 +2231,35 @@ class MainWindow(QMainWindow):
 
         sni_data = self.combo_sni.currentData()
         if sni_data == "__custom__":
-            sni_val = self.edit_custom_sni.text().strip() or "www.google.com"
+            sni_val = self.edit_custom_sni.text().strip() or "www.sferum.ru"
         else:
             sni_val = sni_data
 
         cfg = core.load_config()
+        old_port = int(cfg.get("tg_proxy_port", 1443) or 1443)
         cfg["index"] = idx
         cfg["strategy"] = core.STRATEGIES[idx - 1]["args"]
         cfg["udp_mode"] = udp_mode
         cfg["fake_sni"] = sni_val
         cfg["minimize_to_tray"] = self.chk_minimize_tray.isChecked()
+        cfg["tg_dpi_bypass"] = self.chk_tg_dpi.isChecked()
+        cfg["tg_proxy_enabled"] = self.chk_tg_proxy.isChecked()
+        cfg["tg_proxy_port"] = int(self.spin_tg_port.value())
+        core.ensure_tg_secret(cfg)
         core.save_config(cfg)
 
-        self.append_log(f"Настройки сохранены: стратегия #{idx}, UDP={udp_mode.upper()}, SNI={sni_val}")
+        if not cfg["tg_proxy_enabled"]:
+            self.tg_proxy.stop()
+            core.stop_tg_proxy_detached()
+        elif cfg["tg_proxy_port"] != old_port or not (self.tg_proxy.is_running() or core.is_tg_proxy_port_open(cfg["tg_proxy_port"])):
+            self.tg_proxy.stop()
+            core.stop_tg_proxy_detached()
+            self._ensure_tg_proxy_started(cfg)
+
+        self.append_log(
+            f"Настройки сохранены: стратегия #{idx}, UDP={udp_mode.upper()}, SNI={sni_val}, "
+            f"TG-DPI={'ВКЛ' if cfg['tg_dpi_bypass'] else 'ВЫКЛ'}, TG-Мост={cfg['tg_proxy_port']}"
+        )
         if core.is_winws_running():
             self.append_log("Перезапускаем обход для применения новых настроек...")
             self.btn_save_settings.setEnabled(False)
@@ -2159,13 +2379,21 @@ class MainWindow(QMainWindow):
         self.activateWindow()
 
     def _quit_app_keep_bypass(self):
+        if self.tg_proxy.is_running():
+            port = self.tg_proxy._port
+            self.tg_proxy.stop()
+            core.start_tg_proxy_detached(port)
         self._force_quit = True
         self.tray_icon.hide()
         QApplication.quit()
 
     def _quit_app_stop_bypass(self):
         core.kill_winws(timeout=2.0)
-        self._quit_app_keep_bypass()
+        self.tg_proxy.stop()
+        core.stop_tg_proxy_detached()
+        self._force_quit = True
+        self.tray_icon.hide()
+        QApplication.quit()
 
     def closeEvent(self, event):
         cfg = core.load_config()

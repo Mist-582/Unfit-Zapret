@@ -9,6 +9,7 @@ import random
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -47,7 +48,7 @@ LINUX_FWMARK = 0x40000000
 LINUX_NFT_TABLE = "unfit_zapret"
 
 APP_NAME = "Unfit Zapret"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 GITHUB_OWNER = "Mist-582"
 GITHUB_REPO = "Unfit-Zapret"
 GITHUB_AVATAR_URL = f"https://avatars.githubusercontent.com/{GITHUB_OWNER}?s=128"
@@ -160,6 +161,7 @@ BIN_DIR = WORK_DIR / "bin"
 LISTS_DIR = WORK_DIR / "lists"
 CONFIG_FILE = WORK_DIR / "zapret_config.json"
 AUTORUN_LOG_FILE = WORK_DIR / "autorun.log"
+TG_PROXY_PID_FILE = WORK_DIR / "tg_proxy.pid"
 if IS_WINDOWS:
     CURL_EXE = r"C:\Windows\System32\curl.exe" if os.path.exists(r"C:\Windows\System32\curl.exe") else "curl"
 else:
@@ -185,73 +187,123 @@ def get_engine_name() -> str:
 
 STRATEGIES: list[dict[str, str]] = [
     {
-        "name": "Multisplit 681 (Google)",
-        "desc": "Multisplit 681 (Google Client Hello) - рекомендуется для YouTube / Discord",
-        "args": "--dpi-desync=fake,multisplit --dpi-desync-split-seqovl=681 --dpi-desync-split-pos=1 --dpi-desync-fooling=ts --dpi-desync-repeats=8",
+        "name": "ALT13 Sochi + Hostfakesplit (2026)",
+        "desc": "Лидер 2026: altorder hostfakesplit + TLS Sochi/STUN2 из белых списков РФ",
+        "args": "--dpi-desync=fake,hostfakesplit --dpi-desync-fooling=ts --dpi-desync-hostfakesplit-mod=host=mail.ru,altorder=1 --dpi-desync-repeats=5 --dpi-desync-fake-tls={tls_sochi} --dpi-desync-fake-tls={stun2} --dpi-desync-fake-http={tls_sochi}",
     },
     {
-        "name": "Multisplit 664 (Max.ru)",
-        "desc": "Multisplit 664 (Max.ru Client Hello) - альтернативный Multisplit",
-        "args": "--dpi-desync=fake,multisplit --dpi-desync-split-seqovl=664 --dpi-desync-split-pos=1 --dpi-desync-fooling=ts --dpi-desync-repeats=8",
+        "name": "ALT11 Sferum Overlap 664 + STUN2 (2026)",
+        "desc": "Overlap 664 под Sferum/STUN2 (Flowseal 1.10.4) против жёсткого ТСПУ",
+        "args": "--dpi-desync=fake,multisplit --dpi-desync-split-seqovl=664 --dpi-desync-split-pos=1 --dpi-desync-fooling=ts --dpi-desync-repeats=8 --dpi-desync-split-seqovl-pattern={tls_sferum} --dpi-desync-fake-tls={stun2} --dpi-desync-fake-tls={tls_sferum} --dpi-desync-fake-http={tls_sferum}",
     },
     {
-        "name": "Fake TLS Mod (ALT3)",
-        "desc": "Multisplit с Fake TLS Mod (маскировка SNI) - высокая обходимость",
-        "args": "--dpi-desync=fake,multisplit --dpi-desync-split-seqovl=681 --dpi-desync-split-pos=1 --dpi-desync-fooling=ts --dpi-desync-repeats=8 --dpi-desync-fake-tls-mod=rnd,dupsid,sni={fake_sni}",
+        "name": "EXP STUN2 Overlap 480 + Sferum (2026)",
+        "desc": "Экспериментальный быстрый overlap 480 + Sferum для мобильных и проводных сетей",
+        "args": "--dpi-desync=fake,multisplit --dpi-desync-split-seqovl=480 --dpi-desync-split-pos=1 --dpi-desync-fooling=ts --dpi-desync-repeats=4 --dpi-desync-split-seqovl-pattern={stun2} --dpi-desync-fake-tls={tls_sferum} --dpi-desync-fake-http={tls_sferum}",
     },
     {
-        "name": "Badseq + Fake TLS (ALT2)",
-        "desc": "Multisplit с Badseq & Fake TLS Mod - пробивает жёсткие блоки",
-        "args": "--dpi-desync=fake,multisplit --dpi-desync-split-seqovl=681 --dpi-desync-split-pos=1 --dpi-desync-fooling=badseq --dpi-desync-badseq-increment=10000000 --dpi-desync-repeats=8 --dpi-desync-fake-tls-mod=rnd,dupsid,sni={fake_sni}",
+        "name": "Fake TLS Auto (Multidisorder + Badseq)",
+        "desc": "Двойной нулевой фейк TLS 0x00 + инверсия (!) и multidisorder по midsld",
+        "args": "--dpi-desync=fake,multidisorder --dpi-desync-split-pos=1,midsld --dpi-desync-repeats=11 --dpi-desync-fooling=badseq --dpi-desync-fake-tls=0x00000000 --dpi-desync-fake-tls=! --dpi-desync-fake-tls-mod=rnd,dupsid,sni={fake_sni} --dpi-desync-fake-http={tls_sferum}",
     },
     {
-        "name": "Simple Fake TLS (ALT10)",
-        "desc": "Simple Fake TLS - простой обход без фрагментации",
-        "args": "--dpi-desync=fake --dpi-desync-repeats=6 --dpi-desync-fooling=ts --dpi-desync-fake-tls-mod=none",
+        "name": "Fake TLS Auto ALT (Fakedsplit + Badseq 2)",
+        "desc": "Fakedsplit с автоподбором TLS и badseq=2",
+        "args": "--dpi-desync=fake,fakedsplit --dpi-desync-split-pos=1 --dpi-desync-fooling=badseq --dpi-desync-badseq-increment=2 --dpi-desync-repeats=8 --dpi-desync-fake-tls-mod=rnd,dupsid,sni={fake_sni} --dpi-desync-fake-http={tls_sferum}",
     },
     {
-        "name": "Fakedsplit 0x00 (ALT)",
-        "desc": "Fakedsplit 0x00 - классический сплит с фейком",
-        "args": "--dpi-desync=fake,fakedsplit --dpi-desync-repeats=6 --dpi-desync-fooling=ts --dpi-desync-fakedsplit-pattern=0x00",
+        "name": "Fake TLS Auto ALT2 (Overlap 681 + Badseq 10M)",
+        "desc": "Глубокий overlap 681 + badseq 10M и Fake TLS Mod",
+        "args": "--dpi-desync=fake,multisplit --dpi-desync-split-seqovl=681 --dpi-desync-split-pos=1 --dpi-desync-fooling=badseq --dpi-desync-badseq-increment=10000000 --dpi-desync-repeats=8 --dpi-desync-split-seqovl-pattern={tls_google} --dpi-desync-fake-tls-mod=rnd,dupsid,sni={fake_sni} --dpi-desync-fake-http={tls_sferum}",
     },
     {
-        "name": "Hostfakesplit (ALT3)",
-        "desc": "Hostfakesplit - маскировка под Google / выбранный SNI",
-        "args": "--dpi-desync=fake,hostfakesplit --dpi-desync-fake-tls-mod=rnd,dupsid,sni={fake_sni} --dpi-desync-hostfakesplit-mod=host={fake_sni},altorder=1 --dpi-desync-fooling=ts",
+        "name": "Fake TLS Auto ALT3 (Overlap 681 + TS)",
+        "desc": "Overlap 681 с TCP timestamps и маскировкой SNI",
+        "args": "--dpi-desync=fake,multisplit --dpi-desync-split-seqovl=681 --dpi-desync-split-pos=1 --dpi-desync-fooling=ts --dpi-desync-repeats=8 --dpi-desync-split-seqovl-pattern={tls_google} --dpi-desync-fake-tls-mod=rnd,dupsid,sni={fake_sni} --dpi-desync-fake-http={tls_sferum}",
     },
     {
-        "name": "Fake Badseq (ALT8)",
-        "desc": "Fake Badseq - подмена последовательности TCP",
-        "args": "--dpi-desync=fake --dpi-desync-repeats=6 --dpi-desync-fooling=badseq --dpi-desync-badseq-increment=2",
+        "name": "ALT9 Hostfakesplit Ozon (TS + MD5Sig)",
+        "desc": "Без фейк-пакетов TLS: hostfakesplit под ozon.ru с ts+md5sig",
+        "args": "--dpi-desync=hostfakesplit --dpi-desync-repeats=4 --dpi-desync-fooling=ts,md5sig --dpi-desync-hostfakesplit-mod=host=ozon.ru",
     },
     {
-        "name": "Multisplit Badseq (ALT4)",
-        "desc": "Multisplit Badseq - фрагментация с фейком и плохим seq",
-        "args": "--dpi-desync=fake,multisplit --dpi-desync-repeats=6 --dpi-desync-fooling=badseq --dpi-desync-badseq-increment=1000",
+        "name": "ALT7 Multisplit SNIExt+1 (Overlap 679)",
+        "desc": "Разрезание внутри расширения SNI (sniext+1) без фейков",
+        "args": "--dpi-desync=multisplit --dpi-desync-split-pos=2,sniext+1 --dpi-desync-split-seqovl=679 --dpi-desync-split-seqovl-pattern={tls_google}",
     },
     {
-        "name": "Multisplit Raw (ALT6)",
-        "desc": "Multisplit Raw - чистый multisplit без фейковых пакетов",
-        "args": "--dpi-desync=multisplit --dpi-desync-split-seqovl=681 --dpi-desync-split-pos=1",
+        "name": "Simple Fake ALT2 (Sferum + STUN2)",
+        "desc": "Лёгкий фейк Sferum/STUN2 без фрагментации (низкий пинг)",
+        "args": "--dpi-desync=fake --dpi-desync-repeats=6 --dpi-desync-fooling=ts --dpi-desync-fake-tls={stun2} --dpi-desync-fake-tls={tls_sferum} --dpi-desync-fake-http={tls_sferum}",
     },
     {
-        "name": "Multisplit Pos 2 (ALT2)",
-        "desc": "Multisplit Pos 2 - разделение по второй позиции",
-        "args": "--dpi-desync=multisplit --dpi-desync-split-seqovl=652 --dpi-desync-split-pos=2",
+        "name": "General Multisplit 568 (4PDA)",
+        "desc": "Базовый чистый multisplit 568 с 4PDA ClientHello",
+        "args": "--dpi-desync=multisplit --dpi-desync-split-seqovl=568 --dpi-desync-split-pos=1 --dpi-desync-split-seqovl-pattern={tls_4pda}",
+    },
+    {
+        "name": "ALT Fakedsplit 0x00",
+        "desc": "Классический fakedsplit 0x00 с timestamp fooling",
+        "args": "--dpi-desync=fake,fakedsplit --dpi-desync-repeats=6 --dpi-desync-fooling=ts --dpi-desync-fakedsplit-pattern=0x00 --dpi-desync-fake-tls={stun} --dpi-desync-fake-tls={tls_google} --dpi-desync-fake-http={tls_sferum}",
+    },
+    {
+        "name": "[Unfit AI-1] Chaos Multidisorder (7-point SNI)",
+        "desc": "7-точечное перемешивание сегментов SNI ломает ИИ-классификатор без фейков",
+        "args": "--dpi-desync=multidisorder --dpi-desync-split-pos=1,sniext+1,host+1,midsld-2,midsld,midsld+2,endhost-1",
+    },
+    {
+        "name": "[Unfit AI-2] Ghost FakeTLS + RndSNI + Padencap",
+        "desc": "Случайный SNI + padencap + md5sig/badseq сбивает эвристику ТСПУ",
+        "args": "--dpi-desync=fake,multidisorder --dpi-desync-split-pos=1,sniext+1,midsld --dpi-desync-fooling=md5sig,badseq --dpi-desync-badseq-increment=10000 --dpi-desync-repeats=6 --dpi-desync-fake-tls=0x00000000 --dpi-desync-fake-tls={tls_sferum} --dpi-desync-fake-tls-mod=rnd,rndsni,dupsid,padencap --dpi-desync-fake-http={tls_sferum}",
+    },
+    {
+        "name": "[Unfit AI-3] Whitelist 5ka + AutoTTL + Disorder",
+        "desc": "AutoTTL до ближайшего ТСПУ + белый шаблон 5ka.ru и fakeddisorder",
+        "args": "--dpi-desync=fake,fakeddisorder --dpi-desync-split-pos=1,midsld --dpi-desync-autottl=2:2-12 --dpi-desync-fooling=badseq,ts --dpi-desync-repeats=6 --dpi-desync-fakedsplit-pattern={tls_5ka} --dpi-desync-fake-tls={tls_5ka} --dpi-desync-fake-tls-mod=rnd,dupsid,sni={fake_sni} --dpi-desync-fake-http={tls_5ka}",
+    },
+    {
+        "name": "[Unfit AI-4] Deep Hostfakesplit (Midhost + Badseq/Badsum)",
+        "desc": "Подмена середины хоста (midhost) + overlap 654 под белый списочный домен",
+        "args": "--dpi-desync=fake,hostfakesplit --dpi-desync-hostfakesplit-midhost=host-2 --dpi-desync-hostfakesplit-mod=host={fake_sni},altorder=1 --dpi-desync-split-seqovl=654 --dpi-desync-split-seqovl-pattern={tls_5ka} --dpi-desync-fooling=badseq,badsum --dpi-desync-badseq-increment=0 --dpi-desync-repeats=4 --dpi-desync-fake-tls={tls_5ka} --dpi-desync-fake-http={tls_5ka}",
+    },
+    {
+        "name": "[Unfit AI-5] Dual-Fake Dup + MD5Sig (Anti-Stateful)",
+        "desc": "Дублирование обманных пакетов (--dup) против stateful-анализаторов ТСПУ",
+        "args": "--dpi-desync=fake,fakeddisorder --dpi-desync-split-pos=1,midsld --dpi-desync-fooling=md5sig,badseq --dpi-desync-repeats=5 --dup=1 --dup-cutoff=n2 --dup-fooling=md5sig --dpi-desync-fake-tls={tls_sochi} --dpi-desync-fake-tls-mod=rnd,dupsid,sni={fake_sni} --dpi-desync-fake-http={tls_sochi}",
+    },
+    {
+        "name": "[Unfit AI-6] Syndata + Multidisorder",
+        "desc": "Вброс TLS-данных на этапе TCP SYN + разрезание ClientHello",
+        "args": "--dpi-desync=syndata,multidisorder --dpi-desync-split-pos=1,sniext+1,midsld --dpi-desync-fake-syndata={tls_sferum}",
+    },
+    {
+        "name": "[Unfit AI-7] Stealth Overlap 517 (Badseq + MD5Sig)",
+        "desc": "Стелс-перекрытие 517 байт с двойной десинхронизацией badseq+md5sig",
+        "args": "--dpi-desync=fake,multisplit --dpi-desync-split-pos=1,sniext+1 --dpi-desync-split-seqovl=517 --dpi-desync-split-seqovl-pattern={tls_google} --dpi-desync-fooling=badseq,md5sig --dpi-desync-repeats=6 --dpi-desync-fake-tls={tls_sferum} --dpi-desync-fake-tls-mod=rnd,dupsid,sni={fake_sni} --dpi-desync-fake-http={tls_sferum}",
+    },
+    {
+        "name": "[Unfit AI-8] Triple-Fake + SeqOvl 336 (Strict ISP)",
+        "desc": "Тройной фейк (0x00 + 0x0F + Sferum) с seqovl 336 для самых тяжёлых сетей",
+        "args": "--dpi-desync=fake,multidisorder --dpi-desync-split-pos=10,midsld --dpi-desync-split-seqovl=336 --dpi-desync-split-seqovl-pattern={tls_sferum} --dpi-desync-fooling=badseq --dpi-desync-repeats=6 --dpi-desync-fake-tls=0x00000000 --dpi-desync-fake-tls=0x0F0F0F0F --dpi-desync-fake-tls={tls_sferum} --dpi-desync-fake-tls-mod=rnd,dupsid,sni={fake_sni} --dpi-desync-fake-http={tls_sferum}",
     },
 ]
 
 STRATEGY_STRINGS = [s["args"] for s in STRATEGIES]
 
 POPULAR_SNIS = [
+    "www.sferum.ru",
+    "ozon.ru",
+    "mail.ru",
+    "ya.ru",
+    "5ka.ru",
+    "rutube.ru",
+    "max.ru",
+    "gosuslugi.ru",
+    "vk.com",
+    "yandex.ru",
     "www.google.com",
-    "www.microsoft.com",
     "www.cloudflare.com",
     "www.apple.com",
-    "www.wikipedia.org",
-    "yandex.ru",
-    "vk.com",
-    "gosuslugi.ru",
     "random",
 ]
 
@@ -271,6 +323,8 @@ REQUIRED_LIST_FILES = [
     "ipset-exclude-user.txt",
     "list-google.txt",
     "list-gemini.txt",
+    "list-telegram.txt",
+    "ipset-telegram.txt",
     "ipset-all.txt",
 ]
 
@@ -444,7 +498,13 @@ def cleanup_linux_firewall() -> None:
     for ipt in ("iptables", "ip6tables"):
         if not shutil.which(ipt):
             continue
-        for proto, dports in (("tcp", "80,443,2053,2083,2087,2096,8443"), ("udp", "443,19294:19344,50000:50100"), ("udp", "443,19294:19344,50000:65535"), ("udp", "443,19294:19344,12")):
+        for proto, dports in (
+            ("tcp", "80,443,2053,2083,2087,2096,5222,8443"),
+            ("tcp", "80,443,2053,2083,2087,2096,8443"),
+            ("udp", "443,19294:19344,50000:50100"),
+            ("udp", "443,19294:19344,50000:65535"),
+            ("udp", "443,19294:19344,12"),
+        ):
             for _ in range(3):
                 try:
                     res = subprocess.run(
@@ -475,7 +535,7 @@ def setup_linux_firewall(udp_ports: str) -> tuple[bool, str]:
             f"add table inet {LINUX_NFT_TABLE}\n"
             f"add chain inet {LINUX_NFT_TABLE} postrouting {{ type filter hook postrouting priority mangle; policy accept; }}\n"
             f"add rule inet {LINUX_NFT_TABLE} postrouting meta mark & {LINUX_FWMARK:#x} != 0 return\n"
-            f"add rule inet {LINUX_NFT_TABLE} postrouting tcp dport {{ 80, 443, 2053, 2083, 2087, 2096, 8443 }} queue num {LINUX_NFQ_NUM} bypass\n"
+            f"add rule inet {LINUX_NFT_TABLE} postrouting tcp dport {{ 80, 443, 2053, 2083, 2087, 2096, 5222, 8443 }} queue num {LINUX_NFQ_NUM} bypass\n"
             f"add rule inet {LINUX_NFT_TABLE} postrouting udp dport {{ {nft_udp} }} queue num {LINUX_NFQ_NUM} bypass\n"
         )
         try:
@@ -492,7 +552,7 @@ def setup_linux_firewall(udp_ports: str) -> tuple[bool, str]:
         if not shutil.which(ipt):
             continue
         ok_family = True
-        for proto, dports in (("tcp", "80,443,2053,2083,2087,2096,8443"), ("udp", ipt_udp)):
+        for proto, dports in (("tcp", "80,443,2053,2083,2087,2096,5222,8443"), ("udp", ipt_udp)):
             res = subprocess.run(
                 [
                     ipt, "-t", "mangle", "-I", "POSTROUTING",
@@ -569,13 +629,29 @@ def cleanup_windivert() -> None:
             pass
 
 
+def ensure_tg_secret(cfg: dict) -> str:
+    raw = str(cfg.get("tg_proxy_secret", "") or "").strip().lower()
+    if raw.startswith("dd") and len(raw) == 34:
+        raw = raw[2:]
+    if len(raw) == 32 and all(c in "0123456789abcdef" for c in raw):
+        cfg["tg_proxy_secret"] = raw
+        return raw
+    secret = os.urandom(16).hex()
+    cfg["tg_proxy_secret"] = secret
+    return secret
+
+
 def default_config() -> dict:
     return {
-        "strategy": STRATEGIES[2]["args"],
-        "index": 3,
+        "strategy": STRATEGIES[0]["args"],
+        "index": 1,
         "udp_mode": "narrow",
-        "fake_sni": "www.google.com",
+        "fake_sni": "www.sferum.ru",
         "minimize_to_tray": True,
+        "tg_dpi_bypass": True,
+        "tg_proxy_enabled": True,
+        "tg_proxy_port": 1443,
+        "tg_proxy_secret": "",
     }
 
 
@@ -596,6 +672,18 @@ def load_config() -> dict:
                     cfg["fake_sni"] = str(data["fake_sni"])
                 if isinstance(data.get("minimize_to_tray"), bool):
                     cfg["minimize_to_tray"] = data["minimize_to_tray"]
+                if isinstance(data.get("tg_dpi_bypass"), bool):
+                    cfg["tg_dpi_bypass"] = data["tg_dpi_bypass"]
+                if isinstance(data.get("tg_proxy_enabled"), bool):
+                    cfg["tg_proxy_enabled"] = data["tg_proxy_enabled"]
+                if isinstance(data.get("tg_proxy_port"), int) and 1024 <= data["tg_proxy_port"] <= 65535:
+                    cfg["tg_proxy_port"] = data["tg_proxy_port"]
+                if data.get("tg_proxy_secret"):
+                    raw_s = str(data["tg_proxy_secret"]).strip().lower()
+                    if raw_s.startswith("dd") and len(raw_s) == 34:
+                        raw_s = raw_s[2:]
+                    if len(raw_s) == 32 and all(c in "0123456789abcdef" for c in raw_s):
+                        cfg["tg_proxy_secret"] = raw_s
         except Exception:
             pass
     return cfg
@@ -689,9 +777,18 @@ def resolve_udp_ports(udp_mode: str) -> tuple[str, str]:
     return "443,19294-19344,12", "19294-19344,12"
 
 
+def _bin_asset(name: str, fallback: str = "") -> str:
+    p = BIN_DIR / name
+    if p.exists() or not fallback:
+        return p.as_posix()
+    fb = BIN_DIR / fallback
+    return fb.as_posix() if fb.exists() else p.as_posix()
+
+
 def get_winws_args(strategy_str: str, config: dict, log_cb: Optional[Callable[[str], None]] = None) -> list[str]:
-    fake_sni = config.get("fake_sni", "www.google.com")
+    fake_sni = config.get("fake_sni", "www.sferum.ru")
     udp_mode = config.get("udp_mode", "narrow")
+    tg_dpi_bypass = bool(config.get("tg_dpi_bypass", True))
 
     if fake_sni == "random":
         available = [s for s in POPULAR_SNIS if s != "random"]
@@ -701,24 +798,64 @@ def get_winws_args(strategy_str: str, config: dict, log_cb: Optional[Callable[[s
     else:
         resolved_sni = fake_sni
 
-    resolved_strategy = strategy_str.replace("{fake_sni}", resolved_sni)
+    tls_google = _bin_asset("tls_clienthello_www_google_com.bin")
+    tls_sferum = _bin_asset("tls_clienthello_www_sferum_ru.bin", "tls_clienthello_max_ru.bin")
+    tls_sochi = _bin_asset("tls_clienthello_sochi_park.bin", "tls_clienthello_www_google_com.bin")
+    tls_5ka = _bin_asset("tls_clienthello_5ka_ru.bin", "tls_clienthello_max_ru.bin")
+    tls_max = _bin_asset("tls_clienthello_max_ru.bin")
+    tls_4pda = _bin_asset("tls_clienthello_4pda_to.bin")
+    stun2 = _bin_asset("stun2.bin", "stun.bin")
+    stun = _bin_asset("stun.bin")
+    quic_google = _bin_asset("quic_initial_www_google_com.bin")
+    quic_5ka = _bin_asset("quic_initial_5ka_ru.bin", "quic_initial_www_google_com.bin")
+    discord_udp = _bin_asset("ACTIVE_DISCORD_UDP.bin", "quic_initial_www_google_com.bin")
+    game_udp = _bin_asset("ACTIVE_GAME_UDP.bin", "quic_initial_www_google_com.bin")
+
+    resolved_strategy = (
+        strategy_str
+        .replace("{fake_sni}", resolved_sni)
+        .replace("{tls_google}", tls_google)
+        .replace("{tls_sferum}", tls_sferum)
+        .replace("{tls_sochi}", tls_sochi)
+        .replace("{tls_5ka}", tls_5ka)
+        .replace("{tls_max}", tls_max)
+        .replace("{tls_4pda}", tls_4pda)
+        .replace("{stun2}", stun2)
+        .replace("{stun}", stun)
+        .replace("{quic_google}", quic_google)
+        .replace("{quic_5ka}", quic_5ka)
+        .replace("{discord_udp}", discord_udp)
+        .replace("{game_udp}", game_udp)
+    )
     udp_ports, udp_voice_filter = resolve_udp_ports(udp_mode)
     strat_parts = resolved_strategy.split()
 
     if "--dpi-desync-split-seqovl=681" in resolved_strategy and not any(
         x.startswith("--dpi-desync-split-seqovl-pattern") for x in strat_parts
     ):
-        strat_parts.append(f'--dpi-desync-split-seqovl-pattern={(BIN_DIR / "tls_clienthello_www_google_com.bin").as_posix()}')
+        strat_parts.append(f"--dpi-desync-split-seqovl-pattern={tls_google}")
     elif "--dpi-desync-split-seqovl=664" in resolved_strategy and not any(
         x.startswith("--dpi-desync-split-seqovl-pattern") for x in strat_parts
     ):
-        strat_parts.append(f'--dpi-desync-split-seqovl-pattern={(BIN_DIR / "tls_clienthello_max_ru.bin").as_posix()}')
+        strat_parts.append(f"--dpi-desync-split-seqovl-pattern={tls_sferum}")
+
+    desync_modes = next((x.split("=", 1)[1].split(",") for x in strat_parts if x.startswith("--dpi-desync=")), [])
+    uses_fake = any(m in ("fake", "fakedsplit", "fakeddisorder", "fakeknown") for m in desync_modes)
+    has_fake_tls = any(x.startswith("--dpi-desync-fake-tls=") for x in strat_parts)
+    has_fake_http = any(x.startswith("--dpi-desync-fake-http=") for x in strat_parts)
+
+    google_fake_args = [f"--dpi-desync-fake-tls={tls_google}"] if (uses_fake and not has_fake_tls) else []
+    gen_fake_args: list[str] = []
+    if uses_fake and not has_fake_tls:
+        gen_fake_args.extend((f"--dpi-desync-fake-tls={stun2}", f"--dpi-desync-fake-tls={tls_sferum}"))
+    if uses_fake and not has_fake_http:
+        gen_fake_args.append(f"--dpi-desync-fake-http={tls_sferum}")
 
     engine_bin = str(get_engine_binary())
     if IS_WINDOWS:
         prefix = [
             engine_bin,
-            "--wf-tcp=80,443,2053,2083,2087,2096,8443",
+            "--wf-tcp=80,443,2053,2083,2087,2096,5222,8443",
             f"--wf-udp={udp_ports}",
         ]
     else:
@@ -737,8 +874,8 @@ def get_winws_args(strategy_str: str, config: dict, log_cb: Optional[Callable[[s
         "--filter-l7=discord,stun",
         "--dpi-desync=fake",
         "--dpi-desync-repeats=6",
-        f'--dpi-desync-fake-discord={(BIN_DIR / "quic_initial_www_google_com.bin").as_posix()}',
-        f'--dpi-desync-fake-stun={(BIN_DIR / "quic_initial_www_google_com.bin").as_posix()}',
+        f"--dpi-desync-fake-discord={discord_udp}",
+        f"--dpi-desync-fake-stun={discord_udp}",
         "--new",
         # UDP 443 General
         "--filter-udp=443",
@@ -750,12 +887,12 @@ def get_winws_args(strategy_str: str, config: dict, log_cb: Optional[Callable[[s
         f'--ipset-exclude={(LISTS_DIR / "ipset-exclude-user.txt").as_posix()}',
         "--dpi-desync=fake",
         "--dpi-desync-repeats=11",
-        f'--dpi-desync-fake-quic={(BIN_DIR / "quic_initial_www_google_com.bin").as_posix()}',
+        f"--dpi-desync-fake-quic={quic_google}",
         "--new",
         # TCP Discord Media
         "--filter-tcp=2053,2083,2087,2096,8443",
         "--hostlist-domains=discord.media",
-        f'--dpi-desync-fake-tls={(BIN_DIR / "tls_clienthello_www_google_com.bin").as_posix()}',
+        *google_fake_args,
         *strat_parts,
         "--new",
         # TCP Google & Gemini
@@ -763,9 +900,39 @@ def get_winws_args(strategy_str: str, config: dict, log_cb: Optional[Callable[[s
         f'--hostlist={(LISTS_DIR / "list-google.txt").as_posix()}',
         f'--hostlist={(LISTS_DIR / "list-gemini.txt").as_posix()}',
         "--ip-id=zero",
-        f'--dpi-desync-fake-tls={(BIN_DIR / "tls_clienthello_www_google_com.bin").as_posix()}',
+        *google_fake_args,
         *strat_parts,
         "--new",
+    ]
+
+    if tg_dpi_bypass:
+        tg_unknown_fake = [f"--dpi-desync-fake-unknown={tls_sferum}"] if uses_fake else []
+        args.extend([
+            # Telegram QUIC UDP 443
+            "--filter-udp=443",
+            f'--hostlist={(LISTS_DIR / "list-telegram.txt").as_posix()}',
+            "--dpi-desync=fake",
+            "--dpi-desync-repeats=11",
+            f"--dpi-desync-fake-quic={quic_5ka}",
+            "--new",
+            # Telegram Web/WS TCP
+            "--filter-tcp=80,443",
+            f'--hostlist={(LISTS_DIR / "list-telegram.txt").as_posix()}',
+            *gen_fake_args,
+            *strat_parts,
+            "--new",
+            # Telegram Direct DC MTProto TCP
+            "--filter-tcp=80,443,5222",
+            f'--ipset={(LISTS_DIR / "ipset-telegram.txt").as_posix()}',
+            "--dpi-desync-any-protocol=1",
+            "--dpi-desync-cutoff=n4",
+            *gen_fake_args,
+            *tg_unknown_fake,
+            *strat_parts,
+            "--new",
+        ])
+
+    args.extend([
         # TCP General (HTTP/HTTPS)
         "--filter-tcp=80,443",
         f'--hostlist={(LISTS_DIR / "list-general.txt").as_posix()}',
@@ -774,9 +941,7 @@ def get_winws_args(strategy_str: str, config: dict, log_cb: Optional[Callable[[s
         f'--hostlist-exclude={(LISTS_DIR / "list-exclude-user.txt").as_posix()}',
         f'--ipset-exclude={(LISTS_DIR / "ipset-exclude.txt").as_posix()}',
         f'--ipset-exclude={(LISTS_DIR / "ipset-exclude-user.txt").as_posix()}',
-        f'--dpi-desync-fake-tls={(BIN_DIR / "stun.bin").as_posix()}',
-        f'--dpi-desync-fake-tls={(BIN_DIR / "tls_clienthello_www_google_com.bin").as_posix()}',
-        f'--dpi-desync-fake-http={(BIN_DIR / "tls_clienthello_max_ru.bin").as_posix()}',
+        *gen_fake_args,
         *strat_parts,
         "--new",
         # UDP Fallback (ipset-all)
@@ -788,7 +953,7 @@ def get_winws_args(strategy_str: str, config: dict, log_cb: Optional[Callable[[s
         f'--ipset-exclude={(LISTS_DIR / "ipset-exclude-user.txt").as_posix()}',
         "--dpi-desync=fake",
         "--dpi-desync-repeats=11",
-        f'--dpi-desync-fake-quic={(BIN_DIR / "quic_initial_www_google_com.bin").as_posix()}',
+        f"--dpi-desync-fake-quic={quic_google}",
         "--new",
         # TCP Fallback (ipset-all)
         "--filter-tcp=80,443,8443",
@@ -797,12 +962,10 @@ def get_winws_args(strategy_str: str, config: dict, log_cb: Optional[Callable[[s
         f'--hostlist-exclude={(LISTS_DIR / "list-exclude-user.txt").as_posix()}',
         f'--ipset-exclude={(LISTS_DIR / "ipset-exclude.txt").as_posix()}',
         f'--ipset-exclude={(LISTS_DIR / "ipset-exclude-user.txt").as_posix()}',
-        f'--dpi-desync-fake-tls={(BIN_DIR / "stun.bin").as_posix()}',
-        f'--dpi-desync-fake-tls={(BIN_DIR / "tls_clienthello_www_google_com.bin").as_posix()}',
-        f'--dpi-desync-fake-http={(BIN_DIR / "tls_clienthello_max_ru.bin").as_posix()}',
+        *gen_fake_args,
         *strat_parts,
         "--new",
-    ]
+    ])
     return args
 
 
@@ -810,7 +973,7 @@ def start_bypass_background(log_cb: Optional[Callable[[str], None]] = None) -> t
     # Запуск без PIPE, при стартовом сбое чистим драйвер/правила и повторяем
     ensure_files_exist()
     cfg = load_config()
-    strat = cfg.get("strategy", "") or STRATEGIES[2]["args"]
+    strat = cfg.get("strategy", "") or STRATEGIES[0]["args"]
     engine_bin = get_engine_binary()
     engine_name = engine_bin.name
     if not engine_bin.exists():
@@ -1238,6 +1401,82 @@ def _write_autorun_log(message: str) -> None:
         pass
 
 
+def is_tg_proxy_port_open(port: int, host: str = "127.0.0.1") -> bool:
+    try:
+        with socket.create_connection((host, int(port)), timeout=0.3):
+            return True
+    except OSError:
+        return False
+
+
+def stop_tg_proxy_detached() -> None:
+    if TG_PROXY_PID_FILE.exists():
+        try:
+            pid = int(TG_PROXY_PID_FILE.read_text(encoding="utf-8").strip())
+            if pid > 0 and pid in iter_processes():
+                if IS_WINDOWS:
+                    subprocess.run(
+                        ["taskkill", "/f", "/pid", str(pid)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=CREATE_NO_WINDOW,
+                        timeout=4,
+                    )
+                else:
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except OSError:
+                        pass
+        except Exception:
+            pass
+        try:
+            TG_PROXY_PID_FILE.unlink()
+        except OSError:
+            pass
+
+
+def start_tg_proxy_detached(port: Optional[int] = None) -> tuple[bool, str]:
+    ensure_files_exist()
+    cfg = load_config()
+    target_port = int(port or cfg.get("tg_proxy_port", 1443) or 1443)
+    if is_tg_proxy_port_open(target_port):
+        return True, f"Telegram WS-Мост уже работает на 127.0.0.1:{target_port}"
+
+    if not cfg.get("tg_proxy_secret"):
+        ensure_tg_secret(cfg)
+        save_config(cfg)
+
+    cmd_exe, _, wd = get_self_launch_spec()
+    if is_compiled_binary():
+        spawn_cmd = [cmd_exe, "--tg-proxy"]
+    else:
+        script = str((Path(__file__).resolve().parent / "zapret_manager.py").resolve())
+        spawn_cmd = [cmd_exe, script, "--tg-proxy"]
+
+    kwargs = dict(
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        cwd=wd,
+        close_fds=True,
+    )
+    try:
+        if IS_WINDOWS:
+            proc = subprocess.Popen(spawn_cmd, creationflags=BACKGROUND_FLAGS, **kwargs)
+        else:
+            proc = subprocess.Popen(spawn_cmd, start_new_session=True, **kwargs)
+        WORK_DIR.mkdir(parents=True, exist_ok=True)
+        TG_PROXY_PID_FILE.write_text(str(proc.pid), encoding="utf-8")
+    except Exception as e:
+        return False, f"Ошибка запуска TG-Моста: {e}"
+
+    for _ in range(10):
+        time.sleep(0.2)
+        if is_tg_proxy_port_open(target_port):
+            return True, f"Telegram WS-Мост запущен в фоне на 127.0.0.1:{target_port}"
+    return proc.poll() is None, f"Telegram WS-Мост запущен (порт {target_port})"
+
+
 def run_autorun_background() -> int:
     mutex = None
     lock_fd = None
@@ -1263,14 +1502,21 @@ def run_autorun_background() -> int:
 
     try:
         ensure_files_exist()
+        cfg = load_config()
         if is_winws_running():
             _write_autorun_log(f"{get_engine_name()} уже запущен, повторный запуск не требуется.")
+            if cfg.get("tg_proxy_enabled", True):
+                tg_ok, tg_msg = start_tg_proxy_detached()
+                _write_autorun_log(f"TG-Мост: ok={tg_ok}, msg={tg_msg}")
             return 0
 
         for attempt in range(1, 6):
             ok, msg = start_bypass_background(log_cb=_write_autorun_log)
             _write_autorun_log(f"Попытка {attempt}/5: ok={ok}, msg={msg}")
             if ok:
+                if cfg.get("tg_proxy_enabled", True):
+                    tg_ok, tg_msg = start_tg_proxy_detached()
+                    _write_autorun_log(f"TG-Мост: ok={tg_ok}, msg={tg_msg}")
                 return 0
             cleanup_windivert()
             time.sleep(3)

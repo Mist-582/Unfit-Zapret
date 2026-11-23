@@ -2,9 +2,10 @@
 
 Кроссплатформенный графический менеджер обхода DPI для **Windows** и **Linux** (на базе [zapret](https://github.com/bol-van/zapret) `winws` / `nfqws` и PyQt6).
 
-## Возможности
-- Готовые стратегии обхода DPI для Discord, YouTube, Telegram и X/Twitter
-- **Авто-Тюнинг** с параллельной проверкой стратегий и подбором Fake SNI
+## Возможности (v2.1.0)
+- **20 актуальных стратегий обхода DPI 2026 года:** 12 свежих пресетов (`ALT13 Sochi`, `ALT11 Sferum 664 + STUN2`, `EXP 480`, `Fake TLS Auto`, `ALT9 Ozon`, `ALT7 SNIExt+1`) и 8 кастомных стратегий `[Unfit AI-1..8]` против ML/ИИ-анализаторов ТСПУ
+- **Двойной обход Telegram:** DPI-десинхронизация веб-версии и прямых подсетей Telegram (`list-telegram.txt`, `ipset-telegram.txt`, порт `5222`) + встроенный **Telegram WS-Мост** (`127.0.0.1:1443`, MTProto ↔ WebSocket с резервом Cloudflare)
+- **Авто-Тюнинг** с параллельной проверкой YouTube, Discord и Telegram и подбором Fake SNI
 - **Кроссплатформенный автозапуск:**
   - Windows: Планировщик задач (`BootTrigger` + `LogonTrigger` от `SYSTEM`)
   - Linux: `systemd`-сервис `unfit-zapret.service`

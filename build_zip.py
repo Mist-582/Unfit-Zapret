@@ -19,6 +19,7 @@ ZAPRET_ZIP_URL = "https://github.com/bol-van/zapret/releases/download/v72.13/zap
 COMMON_SOURCES = [
     "zapret_core.py",
     "zapret_manager.py",
+    "tg_proxy.py",
     "zapret_config.json",
     "app_icon.ico",
     "README.md",
