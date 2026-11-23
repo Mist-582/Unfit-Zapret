@@ -1,3 +1,10 @@
+fortnite.com
+unrealengine.com
+epicgames.com
+epicgames.dev
+epicgames.net
+epicgames.org
+epicgamescdn.com
 
 telegram.org
 t.me
@@ -14,6 +21,20 @@ stel.systems
 stel.com
 tgstat.ru
 tgstat.com
+tg.dev
+fragment.com
+telegram-cdn.org
+cdn4.telegram-cdn.org
+kws1.web.telegram.org
+kws2.web.telegram.org
+kws3.web.telegram.org
+kws4.web.telegram.org
+kws5.web.telegram.org
+kws1-1.web.telegram.org
+kws2-1.web.telegram.org
+kws3-1.web.telegram.org
+kws4-1.web.telegram.org
+kws5-1.web.telegram.org
 
 discord.com
 discord.gg
@@ -117,6 +138,12 @@ cloudflarestatus.com
 cloudflarestorage.com
 cloudflarestream.com
 cloudflaretest.com
+^dns.google
+^dns.quad9.net
+^dns.nextdns.io
+^doh.opendns.com
+klipy.com
+live-video.net
 1.1.1.1.cdn.cloudflare.net
 cloudflare-dns.com
 
@@ -235,7 +262,6 @@ nflxext.com
 netflix.net
 nflximg.com
 
-twitch.tv (duplicate removed below)
 kick.com
 
 vimeo.com
@@ -272,7 +298,6 @@ paypalobjects.com
 stripe.com
 stripecdn.com
 
-twitch.tv
 frankerfacez.com
 ffzap.com
 betterttv.net
@@ -308,7 +333,6 @@ playvalorant.com
 ea.com
 origin.com
 
-twitch.tv (duplicate removed)
 youtube-nocookie.com
 
 wikipedia.org
