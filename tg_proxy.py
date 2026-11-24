@@ -5,6 +5,7 @@ import base64
 import ctypes
 import ctypes.util
 import hashlib
+import http.client
 import os
 import random
 import re
@@ -379,6 +380,13 @@ def _set_sock_opts(transport, buf_size: int = 262144) -> None:
         pass
 
 
+class WsHandshakeError(ConnectionError):
+    def __init__(self, status_code: int, message: str, location: str = ""):
+        self.status_code = status_code
+        self.location = location
+        super().__init__(message)
+
+
 class RawWebSocket:
     OP_CONT = 0x0
     OP_BINARY = 0x2
@@ -392,6 +400,16 @@ class RawWebSocket:
         self.writer = writer
         self._closed = False
         self._frag = bytearray()
+
+    def is_alive(self) -> bool:
+        if self._closed or self.writer is None:
+            return False
+        try:
+            if self.writer.is_closing() or self.reader.at_eof() or self.reader.exception() is not None:
+                return False
+        except Exception:
+            return False
+        return True
 
     @staticmethod
     async def connect(
@@ -411,7 +429,7 @@ class RawWebSocket:
         writer = None
         try:
             reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port, **tls_kw),
+                asyncio.open_connection(host, port, limit=262144, **tls_kw),
                 timeout=timeout,
             )
             _set_sock_opts(writer.transport)
@@ -437,11 +455,16 @@ class RawWebSocket:
                 lines.append(line.decode("utf-8", errors="replace").strip())
 
             if not lines:
-                raise ConnectionError("Empty WebSocket HTTP response")
+                raise WsHandshakeError(0, "Empty WebSocket HTTP response")
             parts = lines[0].split(" ", 2)
             code = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 0
             if code != 101:
-                raise ConnectionError(f"WebSocket handshake HTTP {code}")
+                hdrs: dict[str, str] = {}
+                for hl in lines[1:]:
+                    if ":" in hl:
+                        k, v = hl.split(":", 1)
+                        hdrs[k.strip().lower()] = v.strip()
+                raise WsHandshakeError(code, f"WebSocket handshake HTTP {code}", location=hdrs.get("location", ""))
             return RawWebSocket(reader, writer)
         except BaseException:
             if writer is not None:
@@ -694,7 +717,38 @@ def ensure_secret(cfg: dict) -> str:
     return os.urandom(16).hex()
 
 
+class _PinnedGitHubHTTPSHandler(urllib.request.HTTPSHandler):
+    _GITHUB_IPS = {
+        "raw.githubusercontent.com": "185.199.109.133",
+        "release-assets.githubusercontent.com": "185.199.109.133",
+    }
+
+    def https_open(self, req):
+        host = req.host.split(":")[0]
+        pinned = self._GITHUB_IPS.get(host)
+        if not pinned:
+            return super().https_open(req)
+
+        class _Conn(http.client.HTTPSConnection):
+            def connect(self):
+                self.sock = _socket.create_connection((pinned, self.port or 443), self.timeout, self.source_address)
+                if self._tunnel_host:
+                    self._tunnel()
+                self.sock = self._context.wrap_socket(self.sock, server_hostname=self._tunnel_host or self.host)
+
+        try:
+            return self.do_open(_Conn, req, context=self._context)
+        except Exception:
+            return super().https_open(req)
+
+
 class TgProxyService:
+    POOL_MAX_PER_KEY = 3
+    POOL_TTL_SEC = 75.0
+    DIRECT_COOLDOWN_SEC = 90.0
+    CF_COOLDOWN_SEC = 30.0
+    TCP_COOLDOWN_SEC = 60.0
+
     def __init__(self):
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
@@ -708,6 +762,13 @@ class TgProxyService:
         self._last_error = ""
         self._cf_domains: list[str] = list(CFPROXY_DEFAULT_DOMAINS)
         self._cf_cooldown: dict[tuple[str, bool], float] = {}
+        self._cf_preferred: dict[int, str] = {}
+        self._cf_tls_ok = 0
+        self._cf_notls_ok = 0
+        self._direct_cooldown: dict[tuple[int, bool], float] = {}
+        self._tcp_cooldown: dict[int, float] = {}
+        self._ws_pool: dict[tuple[int, bool, bool], list[tuple[RawWebSocket, float, str]]] = {}
+        self._refill_tasks: dict[tuple[int, bool, bool], asyncio.Task] = {}
         self._stats: dict[str, int] = {
             "active": 0,
             "total": 0,
@@ -799,7 +860,8 @@ class TgProxyService:
                 CFPROXY_DOMAINS_URL,
                 headers={"User-Agent": "Unfit-Zapret-TG-Bridge"},
             )
-            with urllib.request.urlopen(req, timeout=6) as resp:
+            opener = urllib.request.build_opener(_PinnedGitHubHTTPSHandler(context=_SSL_CTX))
+            with opener.open(req, timeout=6) as resp:
                 raw = resp.read().decode("utf-8", errors="ignore")
             decoded = [
                 _decode_cf_domain(line.strip())
@@ -821,7 +883,8 @@ class TgProxyService:
                 lambda r, w: self._handle_client(r, w, secret_bytes),
                 self._host,
                 self._port,
-                reuse_address=True,
+                limit=262144,
+                reuse_address=(sys.platform != "win32"),
             )
         except Exception as e:
             self._last_error = f"Порт {self._port} занят или недоступен: {e}"
@@ -831,49 +894,159 @@ class TgProxyService:
         self._running = True
         self._ready_event.set()
         threading.Thread(target=self._refresh_cf_domains_sync, daemon=True).start()
+        self._schedule_pool_refill((2, False, False))
+        self._schedule_pool_refill((4, False, False))
 
-        async with server:
-            await self._stop_event.wait()
+        try:
+            async with server:
+                await self._stop_event.wait()
+        finally:
+            for t in list(self._refill_tasks.values()):
+                t.cancel()
+            self._refill_tasks.clear()
+            for bucket in self._ws_pool.values():
+                for ws, _, _ in bucket:
+                    try:
+                        await ws.close()
+                    except Exception:
+                        pass
+            self._ws_pool.clear()
+
+    def _pop_pool_ws(self, key: tuple[int, bool, bool]) -> tuple[Optional[RawWebSocket], str]:
+        bucket = self._ws_pool.get(key)
+        now = time.monotonic()
+        chosen: Optional[RawWebSocket] = None
+        chosen_kind = ""
+        if bucket:
+            while bucket:
+                ws, created, kind = bucket.pop(0)
+                if (now - created) < self.POOL_TTL_SEC and ws.is_alive():
+                    chosen = ws
+                    chosen_kind = kind
+                    break
+                asyncio.create_task(ws.close())
+        self._schedule_pool_refill(key)
+        return chosen, chosen_kind
+
+    def _schedule_pool_refill(self, key: tuple[int, bool, bool]) -> None:
+        if not self._running or self._loop is None:
+            return
+        task = self._refill_tasks.get(key)
+        if task is not None and not task.done():
+            return
+        if len(self._ws_pool.get(key, [])) >= self.POOL_MAX_PER_KEY:
+            return
+        try:
+            self._refill_tasks[key] = asyncio.create_task(self._refill_pool_key(key))
+        except Exception:
+            pass
+
+    async def _refill_pool_key(self, key: tuple[int, bool, bool]) -> None:
+        try:
+            dc, is_media, is_test = key
+            bucket = self._ws_pool.setdefault(key, [])
+            needed = self.POOL_MAX_PER_KEY - len(bucket)
+            if needed <= 0 or not self._running:
+                return
+            ws, kind = await self._connect_ws_for_key(dc, is_media, is_test)
+            if ws is None:
+                return
+            if not self._running:
+                await ws.close()
+                return
+            bucket.append((ws, time.monotonic(), kind))
+            rest = self.POOL_MAX_PER_KEY - len(bucket)
+            if rest > 0 and self._running:
+                extra = await asyncio.gather(
+                    *(self._connect_ws_for_key(dc, is_media, is_test) for _ in range(rest)),
+                    return_exceptions=True,
+                )
+                for item in extra:
+                    if isinstance(item, tuple) and item[0] is not None:
+                        w_extra, k_extra = item
+                        if self._running and len(bucket) < self.POOL_MAX_PER_KEY:
+                            bucket.append((w_extra, time.monotonic(), k_extra))
+                        else:
+                            await w_extra.close()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+        finally:
+            self._refill_tasks.pop(key, None)
+
+    async def _connect_ws_for_key(self, dc: int, is_media: bool, is_test: bool) -> tuple[Optional[RawWebSocket], str]:
+        ws = await self._open_ws_direct(dc, is_media, is_test)
+        if ws is not None:
+            return ws, "ws"
+        if not is_test:
+            cf_ws = await self._open_ws_cf(dc)
+            if cf_ws is not None:
+                return cf_ws, "cf"
+        return None, ""
 
     async def _open_ws_direct(self, dc: int, is_media: bool, is_test: bool) -> Optional[RawWebSocket]:
         if is_test:
             ip = DC_TEST_IPS.get(dc)
             path = "/apiws_test"
         else:
-            ip = WS_DIRECT_IPS.get(dc) or DC_DEFAULT_IPS.get(dc)
+            ip = WS_DIRECT_IPS.get(dc)
             path = "/apiws"
         if not ip:
+            return None
+        cd_key = (dc, is_media)
+        if self._direct_cooldown.get(cd_key, 0.0) > time.monotonic():
             return None
         base_dc = 2 if dc == 203 else dc
         domains = [f"kws{base_dc}-1.web.telegram.org", f"kws{base_dc}.web.telegram.org"] if is_media else [f"kws{base_dc}.web.telegram.org"]
         for dom in domains:
             try:
-                return await RawWebSocket.connect(ip, dom, timeout=4.5, path=path, sni=dom, secure=True)
+                ws = await RawWebSocket.connect(ip, dom, timeout=2.5, path=path, sni=dom, secure=True)
+                self._direct_cooldown.pop(cd_key, None)
+                return ws
             except Exception:
                 continue
+        self._direct_cooldown[cd_key] = time.monotonic() + self.DIRECT_COOLDOWN_SEC
         return None
 
-    async def _open_ws_cf(self, dc: int, is_media: bool) -> Optional[RawWebSocket]:
+    async def _open_ws_cf(self, dc: int) -> Optional[RawWebSocket]:
         base_dc = 2 if dc == 203 else dc
-        sub = f"kws{base_dc}-1" if is_media else f"kws{base_dc}"
+        # На Cloudflare существуют только базовые поддомены kws{dc} без -1
+        sub = f"kws{base_dc}"
         with self._lock:
             pool = list(self._cf_domains)
-        random.shuffle(pool)
+            pref = self._cf_preferred.get(base_dc)
+        ordered = [d for d in pool if d != pref]
+        random.shuffle(ordered)
+        if pref:
+            ordered.insert(0, pref)
+
+        secure_order = (True, False) if self._cf_tls_ok >= self._cf_notls_ok else (False, True)
+        timeouts = (2.5, 3.0, 4.0, 5.0)
         now = time.monotonic()
         attempts = 0
-        for base in pool[:8]:
+        for base in ordered[:8]:
             host = f"{sub}.{base}"
-            for secure in (True, False):
+            for secure in secure_order:
                 until = self._cf_cooldown.get((host, secure))
                 if until and now < until:
                     continue
-                attempts += 1
-                if attempts > 10:
+                if attempts >= 10:
                     return None
+                tmo = timeouts[min(attempts, len(timeouts) - 1)]
+                attempts += 1
                 try:
-                    return await RawWebSocket.connect(host, host, timeout=4.0, path="/apiws", secure=secure)
+                    ws = await RawWebSocket.connect(host, host, timeout=tmo, path="/apiws", secure=secure)
+                    with self._lock:
+                        self._cf_preferred[base_dc] = base
+                        if secure:
+                            self._cf_tls_ok += 1
+                        else:
+                            self._cf_notls_ok += 1
+                    self._cf_cooldown.pop((host, secure), None)
+                    return ws
                 except Exception:
-                    self._cf_cooldown[(host, secure)] = time.monotonic() + 30.0
+                    self._cf_cooldown[(host, secure)] = time.monotonic() + self.CF_COOLDOWN_SEC
                     continue
         return None
 
@@ -999,46 +1172,48 @@ class TgProxyService:
             relay_init = generate_relay_init(proto_tag, dc_idx)
             ctx = build_crypto_ctx(clt_prekey_iv, secret, relay_init)
             splitter = MsgSplitter(proto_int)
+            pool_key = (dc, is_media, is_test)
 
-            ws = await self._open_ws_direct(dc, is_media, is_test)
+            ws, kind = self._pop_pool_ws(pool_key)
             if ws is not None:
                 try:
-                    await asyncio.wait_for(ws.send(relay_init), timeout=5.0)
+                    await asyncio.wait_for(ws.send(relay_init), timeout=4.0)
                     with self._lock:
-                        self._stats["ws"] += 1
+                        self._stats[kind] += 1
                     await self._bridge_ws(reader, writer, ws, ctx, splitter)
                     return
                 except Exception:
                     await ws.close()
 
-            if not is_test:
-                cf_ws = await self._open_ws_cf(dc, is_media)
-                if cf_ws is not None:
-                    try:
-                        await asyncio.wait_for(cf_ws.send(relay_init), timeout=5.0)
-                        with self._lock:
-                            self._stats["cf"] += 1
-                        await self._bridge_ws(reader, writer, cf_ws, ctx, splitter)
-                        return
-                    except Exception:
-                        await cf_ws.close()
+            ws, kind = await self._connect_ws_for_key(dc, is_media, is_test)
+            if ws is not None:
+                try:
+                    await asyncio.wait_for(ws.send(relay_init), timeout=4.0)
+                    with self._lock:
+                        self._stats[kind] += 1
+                    self._schedule_pool_refill(pool_key)
+                    await self._bridge_ws(reader, writer, ws, ctx, splitter)
+                    return
+                except Exception:
+                    await ws.close()
 
             ip_table = DC_TEST_IPS if is_test else DC_DEFAULT_IPS
             dst_ip = ip_table.get(dc)
-            if dst_ip:
+            if dst_ip and self._tcp_cooldown.get(dc, 0.0) <= time.monotonic():
                 try:
                     r_reader, r_writer = await asyncio.wait_for(
-                        asyncio.open_connection(dst_ip, 443),
-                        timeout=5.0,
+                        asyncio.open_connection(dst_ip, 443, limit=262144),
+                        timeout=4.5,
                     )
                     _set_sock_opts(r_writer.transport)
                     r_writer.write(relay_init)
                     await r_writer.drain()
+                    self._tcp_cooldown.pop(dc, None)
                     with self._lock:
                         self._stats["tcp"] += 1
                     await self._bridge_tcp(reader, writer, r_reader, r_writer, ctx)
                 except Exception:
-                    pass
+                    self._tcp_cooldown[dc] = time.monotonic() + self.TCP_COOLDOWN_SEC
         finally:
             with self._lock:
                 self._stats["active"] = max(0, self._stats["active"] - 1)
@@ -1047,6 +1222,73 @@ class TgProxyService:
                 await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
             except Exception:
                 pass
+
+
+def probe_proxy(
+    host: str = "127.0.0.1",
+    port: int = 1443,
+    secret_hex: str = "",
+    dc: int = 2,
+    timeout: float = 6.0,
+) -> tuple[bool, int, str]:
+    sec_hex = (secret_hex or "").strip().lower()
+    if sec_hex.startswith("dd") and len(sec_hex) == 34:
+        sec_hex = sec_hex[2:]
+    if len(sec_hex) != 32:
+        try:
+            import zapret_core as core
+            sec_hex = ensure_secret(core.load_config())
+        except Exception:
+            sec_hex = ""
+    if len(sec_hex) != 32:
+        return False, 0, "Не задан секрет Telegram WS-Моста"
+
+    secret = bytes.fromhex(sec_hex)
+    nonce = os.urandom(16)
+    msg_id = int(time.time() * (2**32)) & ~3
+    inner = struct.pack("<I", 0xBE7E8EF1) + nonce
+    mtproto_msg = struct.pack("<qqI", 0, msg_id, len(inner)) + inner
+
+    while True:
+        rnd = bytearray(os.urandom(HANDSHAKE_LEN))
+        if rnd[0] == 0xEF or bytes(rnd[:4]) in RESERVED_STARTS or rnd[4:8] == b"\x00\x00\x00\x00":
+            continue
+        break
+
+    pre_iv = bytes(rnd[SKIP_LEN:SKIP_LEN + PREKEY_LEN + IV_LEN])
+    enc_key = hashlib.sha256(pre_iv[:PREKEY_LEN] + secret).digest()
+    enc_iv = pre_iv[PREKEY_LEN:]
+    rev = pre_iv[::-1]
+    dec_key = hashlib.sha256(rev[:PREKEY_LEN] + secret).digest()
+    dec_iv = rev[PREKEY_LEN:]
+
+    enc = create_aes_ctr(enc_key, enc_iv)
+    ks = enc.update(b"\x00" * HANDSHAKE_LEN)
+    tail = PROTO_TAG_SECURE + struct.pack("<h", dc) + os.urandom(2)
+    for i in range(8):
+        rnd[PROTO_TAG_POS + i] = tail[i] ^ ks[PROTO_TAG_POS + i]
+
+    dec = create_aes_ctr(dec_key, dec_iv)
+    pad = os.urandom(7)
+    pkt = _st_I_le.pack(len(mtproto_msg) + len(pad)) + mtproto_msg + pad
+
+    t0 = time.monotonic()
+    try:
+        with _socket.create_connection((host, int(port)), timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            sock.sendall(bytes(rnd) + enc.update(pkt))
+            resp = sock.recv(4096)
+    except OSError as e:
+        return False, 0, f"Не удалось подключиться к {host}:{port}: {e}"
+
+    if not resp:
+        return False, 0, "Мост разорвал соединение (возможен сбой WS/CF или несовпадение секрета)"
+
+    plain = dec.update(resp)
+    if b"\x63\x24\x16\x05" not in plain:
+        return False, 0, "Получен некорректный ответ MTProto (проверьте секрет)"
+    ms = int(round((time.monotonic() - t0) * 1000))
+    return True, ms, f"Мост работает (DC{dc}: {ms} мс)"
 
 
 def run_standalone_from_config() -> int:
@@ -1068,6 +1310,13 @@ def run_standalone_from_config() -> int:
     if not ok:
         return 1
 
+    own_pid = str(os.getpid())
+    try:
+        core.WORK_DIR.mkdir(parents=True, exist_ok=True)
+        core.TG_PROXY_PID_FILE.write_text(own_pid, encoding="utf-8")
+    except OSError:
+        pass
+
     stop_flag = threading.Event()
     for sig_name in ("SIGINT", "SIGTERM"):
         sig = getattr(signal, sig_name, None)
@@ -1083,4 +1332,9 @@ def run_standalone_from_config() -> int:
                 return 1
     finally:
         svc.stop()
+        try:
+            if core.TG_PROXY_PID_FILE.exists() and core.TG_PROXY_PID_FILE.read_text(encoding="utf-8").strip() == own_pid:
+                core.TG_PROXY_PID_FILE.unlink()
+        except OSError:
+            pass
     return 0

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import ctypes
+import http.client
 import ipaddress
 import json
 import os
@@ -10,6 +12,7 @@ import re
 import shutil
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -29,6 +32,7 @@ IS_WINDOWS = sys.platform == "win32"
 IS_LINUX = sys.platform.startswith("linux")
 
 if IS_WINDOWS:
+    import winreg
     from ctypes import wintypes
     CREATE_NO_WINDOW = 0x08000000
     DETACHED_PROCESS = 0x00000008
@@ -49,10 +53,24 @@ LINUX_FWMARK = 0x40000000
 LINUX_NFT_TABLE = "unfit_zapret"
 
 APP_NAME = "Unfit Zapret"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 GITHUB_OWNER = "Mist-582"
 GITHUB_REPO = "Unfit-Zapret"
 GITHUB_AVATAR_URL = f"https://avatars.githubusercontent.com/{GITHUB_OWNER}?s=128"
+
+DNS_AI_TEMPLATE = "https://dns.dns-ai.ru/dns-query"
+DNS_AI_TLS_HOST = "dns.dns-ai.ru"
+DNS_AI_MANIFESTS = (
+    "https://raw.githubusercontent.com/confeden/DNS-AI/main/endpoints.json",
+    "https://dns-ai.ru/endpoints.json",
+)
+DNS_AI_BUILTIN_V4 = ("194.87.196.13", "45.151.102.219")
+DNS_AI_BUILTIN_V6 = ("2a00:b700:5::3:62", "2a12:5940:d4ef::219")
+DNS_AI_RETIRED = (
+    "217.60.10.20", "94.232.43.149", "185.251.90.181", "2a0a:2b41:0:3840::53",
+    "192.144.59.14", "2a0d:8480:0:67c::14", "186.246.49.127", "2a0a:2b41:0:500d::53",
+)
+DNS_AI_WIN_EXE_URL = "https://github.com/confeden/DNS-AI/releases/latest/download/DNS-AI.exe"
 
 
 def detect_arch() -> str:
@@ -144,16 +162,20 @@ def get_real_executable() -> Path:
 
 def get_work_dir() -> Path:
     if IS_WINDOWS:
-        # ProgramData общая для админа и службы SYSTEM
         if is_compiled_binary() or (get_embedded_assets_zip() is not None and not (Path(__file__).resolve().parent / "bin" / "winws.exe").exists()):
-            prog_data = Path(os.environ.get("ProgramData", r"C:\ProgramData"))
-            return prog_data / "UnfitZapret"
+            sys_drive = os.environ.get("SystemDrive", "C:").rstrip("\\/")
+            return Path(f"{sys_drive}\\") / "UnfitZapret"
         return Path(__file__).resolve().parent
 
     if is_compiled_binary():
-        if hasattr(os, "geteuid") and os.geteuid() == 0:
-            return Path("/opt/unfit-zapret")
-        return Path.home() / ".local" / "share" / "unfit-zapret"
+        sudo_user = os.environ.get("SUDO_USER", "").strip()
+        if sudo_user:
+            try:
+                import pwd
+                return Path(pwd.getpwnam(sudo_user).pw_dir) / "UnfitZapret"
+            except Exception:
+                pass
+        return Path.home() / "UnfitZapret"
     return Path(__file__).resolve().parent
 
 
@@ -163,6 +185,7 @@ LISTS_DIR = WORK_DIR / "lists"
 CONFIG_FILE = WORK_DIR / "zapret_config.json"
 AUTORUN_LOG_FILE = WORK_DIR / "autorun.log"
 TG_PROXY_PID_FILE = WORK_DIR / "tg_proxy.pid"
+DNS_AI_STATE_FILE = WORK_DIR / ".dns_ai_state.json"
 if IS_WINDOWS:
     CURL_EXE = r"C:\Windows\System32\curl.exe" if os.path.exists(r"C:\Windows\System32\curl.exe") else "curl"
 else:
@@ -653,6 +676,7 @@ def default_config() -> dict:
         "tg_proxy_enabled": True,
         "tg_proxy_port": 1443,
         "tg_proxy_secret": "",
+        "desktop_shortcut_created": False,
     }
 
 
@@ -680,11 +704,13 @@ def load_config() -> dict:
                 if isinstance(data.get("tg_proxy_port"), int) and 1024 <= data["tg_proxy_port"] <= 65535:
                     cfg["tg_proxy_port"] = data["tg_proxy_port"]
                 if data.get("tg_proxy_secret"):
-                    raw_s = str(data["tg_proxy_secret"]).strip().lower()
+                    raw_s = str(data.get("tg_proxy_secret")).strip().lower()
                     if raw_s.startswith("dd") and len(raw_s) == 34:
                         raw_s = raw_s[2:]
                     if len(raw_s) == 32 and all(c in "0123456789abcdef" for c in raw_s):
                         cfg["tg_proxy_secret"] = raw_s
+                if isinstance(data.get("desktop_shortcut_created"), bool):
+                    cfg["desktop_shortcut_created"] = data["desktop_shortcut_created"]
         except Exception:
             pass
     return cfg
@@ -696,10 +722,52 @@ def save_config(config: dict) -> None:
         json.dump(config, f, indent=4, ensure_ascii=False)
 
 
+def _migrate_legacy_programdata() -> None:
+    if not IS_WINDOWS:
+        return
+    legacy_dir = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "UnfitZapret"
+    if legacy_dir == WORK_DIR or not legacy_dir.is_dir() or CONFIG_FILE.exists():
+        return
+    try:
+        old_cfg = legacy_dir / "zapret_config.json"
+        if old_cfg.is_file():
+            shutil.copy2(old_cfg, CONFIG_FILE)
+        old_lists = legacy_dir / "lists"
+        if old_lists.is_dir():
+            for item in old_lists.iterdir():
+                if item.is_file() and item.name.endswith("-user.txt"):
+                    dst = LISTS_DIR / item.name
+                    if not dst.exists():
+                        shutil.copy2(item, dst)
+    except OSError:
+        pass
+
+
+def _grant_work_dir_user_access() -> None:
+    if not IS_WINDOWS or not WORK_DIR.exists():
+        return
+    marker = WORK_DIR / ".acl_ready"
+    if marker.exists():
+        return
+    try:
+        res = subprocess.run(
+            ["icacls", str(WORK_DIR), "/grant", "*S-1-5-32-545:(OI)(CI)M", "/T", "/Q"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=CREATE_NO_WINDOW,
+            timeout=8,
+        )
+        if res.returncode == 0:
+            marker.write_text("1", encoding="utf-8")
+    except Exception:
+        pass
+
+
 def ensure_files_exist() -> None:
     WORK_DIR.mkdir(parents=True, exist_ok=True)
     BIN_DIR.mkdir(parents=True, exist_ok=True)
     LISTS_DIR.mkdir(parents=True, exist_ok=True)
+    _migrate_legacy_programdata()
 
     emb_zip = get_embedded_assets_zip()
     if emb_zip is not None:
@@ -746,6 +814,13 @@ def ensure_files_exist() -> None:
                                 dst.write_bytes(zf.read(member))
                             except OSError:
                                 pass
+                    elif rel == "app_icon.ico":
+                        dst = WORK_DIR / "app_icon.ico"
+                        if not dst.exists() or need_update:
+                            try:
+                                dst.write_bytes(zf.read(member))
+                            except OSError:
+                                pass
             if not winws_busy or not current_marker:
                 try:
                     marker_file.write_text(APP_VERSION, encoding="utf-8")
@@ -768,6 +843,7 @@ def ensure_files_exist() -> None:
         if not file_path.exists():
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(f"# Автоматически созданный файл: {filename}\n")
+    _grant_work_dir_user_access()
 
 
 def resolve_udp_ports(udp_mode: str) -> tuple[str, str]:
@@ -1116,9 +1192,191 @@ def check_sites_parallel(timeout: int = 4) -> dict[str, tuple[bool, str]]:
     return results
 
 
+def _run_powershell(script: str, timeout: int = 20) -> tuple[int, str, str]:
+    full = (
+        "$ErrorActionPreference = 'Stop'\n"
+        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n"
+        "$OutputEncoding = [System.Text.Encoding]::UTF8\n"
+        + script
+    )
+    encoded = base64.b64encode(full.encode("utf-16le")).decode("ascii")
+    try:
+        res = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
+            capture_output=True,
+            creationflags=CREATE_NO_WINDOW,
+            stdin=subprocess.DEVNULL,
+            timeout=timeout,
+        )
+        out = res.stdout.decode("utf-8", errors="ignore").strip()
+        err = res.stderr.decode("utf-8", errors="ignore").strip()
+        return res.returncode, out, err
+    except Exception as e:
+        return 1, "", str(e)
+
+
+def get_installed_executable() -> Path:
+    if IS_WINDOWS and is_compiled_binary():
+        return WORK_DIR / "Unfit-Zapret.exe"
+    return get_real_executable()
+
+
+def install_binary_to_work_dir() -> tuple[bool, Path, str]:
+    real_exe = get_real_executable()
+    if not (IS_WINDOWS and is_compiled_binary()):
+        return True, real_exe, ""
+    target = get_installed_executable()
+    if os.path.normcase(os.path.normpath(str(real_exe))) == os.path.normcase(os.path.normpath(str(target))):
+        return True, target, ""
+    if not real_exe.is_file():
+        return False, target, ""
+    try:
+        WORK_DIR.mkdir(parents=True, exist_ok=True)
+        if target.is_file():
+            st_src = real_exe.stat()
+            st_dst = target.stat()
+            if st_src.st_size == st_dst.st_size and abs(st_src.st_mtime - st_dst.st_mtime) < 2.0:
+                return True, target, ""
+        tmp = target.with_name("Unfit-Zapret.exe.tmp")
+        shutil.copy2(real_exe, tmp)
+        os.replace(tmp, target)
+        return True, target, f"Программа скопирована в {target}"
+    except OSError:
+        return False, real_exe, ""
+
+
+def get_desktop_dir() -> Path:
+    if IS_WINDOWS:
+        rc, out, _ = _run_powershell("Write-Output ([Environment]::GetFolderPath('Desktop'))", timeout=5)
+        if rc == 0 and out:
+            p = Path(out.splitlines()[-1].strip())
+            if p.exists():
+                return p
+        return Path.home() / "Desktop"
+
+    sudo_user = os.environ.get("SUDO_USER", "").strip()
+    if sudo_user:
+        try:
+            import pwd
+            home_dir = Path(pwd.getpwnam(sudo_user).pw_dir)
+            d = home_dir / "Desktop"
+            if d.is_dir():
+                return d
+            ru_d = home_dir / "Рабочий стол"
+            if ru_d.is_dir():
+                return ru_d
+            return d
+        except Exception:
+            pass
+    if shutil.which("xdg-user-dir"):
+        try:
+            res = subprocess.run(["xdg-user-dir", "DESKTOP"], capture_output=True, text=True, timeout=3)
+            if res.returncode == 0 and res.stdout.strip():
+                return Path(res.stdout.strip())
+        except Exception:
+            pass
+    return Path.home() / "Desktop"
+
+
+def _ps_quote(s: str) -> str:
+    return "'" + s.replace("'", "''") + "'"
+
+
+def create_desktop_shortcut(
+    target_exe: Optional[Path] = None,
+    desktop_dir: Optional[Path] = None,
+) -> tuple[bool, str]:
+    desk = desktop_dir or get_desktop_dir()
+    desk.mkdir(parents=True, exist_ok=True)
+
+    if IS_WINDOWS:
+        if target_exe is not None:
+            exe_path = Path(target_exe)
+        elif is_compiled_binary():
+            inst = get_installed_executable()
+            exe_path = inst if inst.exists() else get_real_executable()
+        else:
+            py_exe = Path(sys.executable).resolve()
+            pyw = py_exe.with_name("pythonw.exe")
+            exe_path = pyw if pyw.exists() else py_exe
+
+        lnk_path = desk / "Unfit Zapret.lnk"
+        ico_candidate = WORK_DIR / "app_icon.ico"
+        if not ico_candidate.is_file():
+            ico_candidate = Path(__file__).resolve().parent / "app_icon.ico"
+        icon_loc = str(ico_candidate) if ico_candidate.is_file() else f"{exe_path},0"
+        args_str = "" if (is_compiled_binary() or target_exe is not None) else f'"{(Path(__file__).resolve().parent / "zapret_manager.py").resolve()}"'
+        ps = (
+            "$ws = New-Object -ComObject WScript.Shell\n"
+            f"$sc = $ws.CreateShortcut({_ps_quote(str(lnk_path))})\n"
+            f"$sc.TargetPath = {_ps_quote(str(exe_path))}\n"
+            f"$sc.Arguments = {_ps_quote(args_str)}\n"
+            f"$sc.WorkingDirectory = {_ps_quote(str(WORK_DIR))}\n"
+            f"$sc.IconLocation = {_ps_quote(icon_loc)}\n"
+            f"$sc.Description = {_ps_quote('Unfit Zapret — обход DPI, Telegram WS-Мост и DNS-AI')}\n"
+            "$sc.Save()\n"
+        )
+        rc, _, err = _run_powershell(ps, timeout=10)
+        if rc == 0 and lnk_path.is_file():
+            return True, f"Ярлык создан на рабочем столе: {lnk_path}"
+        return False, f"Не удалось создать ярлык: {err or 'ошибка WScript.Shell'}"
+
+    desktop_file = desk / "Unfit-Zapret.desktop"
+    script_or_bin = (
+        str(get_real_executable())
+        if is_compiled_binary()
+        else f"bash {Path(__file__).resolve().parent / 'start_linux.sh'}"
+    )
+    entry = (
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        "Name=Unfit Zapret\n"
+        "Comment=DPI bypass, Telegram WS-Proxy & DNS-AI\n"
+        f"Exec={script_or_bin}\n"
+        f"Path={WORK_DIR}\n"
+        "Terminal=false\n"
+        "Categories=Network;\n"
+    )
+    try:
+        desktop_file.write_text(entry, encoding="utf-8")
+        os.chmod(desktop_file, 0o755)
+        sudo_user = os.environ.get("SUDO_USER", "").strip()
+        if sudo_user:
+            try:
+                import pwd
+                pw = pwd.getpwnam(sudo_user)
+                os.chown(desktop_file, pw.pw_uid, pw.pw_gid)
+            except Exception:
+                pass
+        return True, f"Ярлык создан на рабочем столе: {desktop_file}"
+    except OSError as e:
+        return False, f"Не удалось создать ярлык: {e}"
+
+
+def ensure_installed_and_shortcut() -> list[str]:
+    notes: list[str] = []
+    if not (IS_WINDOWS and is_compiled_binary()):
+        return notes
+    ok_inst, target, msg_inst = install_binary_to_work_dir()
+    if msg_inst:
+        notes.append(msg_inst)
+    cfg = load_config()
+    if not cfg.get("desktop_shortcut_created", False):
+        ok_lnk, msg_lnk = create_desktop_shortcut(target if ok_inst else None)
+        if ok_lnk:
+            cfg["desktop_shortcut_created"] = True
+            try:
+                save_config(cfg)
+            except OSError:
+                pass
+        notes.append(msg_lnk)
+    return notes
+
+
 def get_self_launch_spec() -> tuple[str, str, str]:
     if is_compiled_binary():
-        exe_path = get_real_executable()
+        installed_exe = get_installed_executable()
+        exe_path = installed_exe if (IS_WINDOWS and installed_exe.exists()) else get_real_executable()
         return str(exe_path), "--background", str(exe_path.parent)
     script_path = (
         Path(sys.argv[0]).resolve()
@@ -1410,6 +1668,16 @@ def is_tg_proxy_port_open(port: int, host: str = "127.0.0.1") -> bool:
         return False
 
 
+def is_tg_proxy_detached_running() -> bool:
+    if not TG_PROXY_PID_FILE.exists():
+        return False
+    try:
+        pid = int(TG_PROXY_PID_FILE.read_text(encoding="utf-8").strip())
+        return pid > 0 and pid in iter_processes()
+    except Exception:
+        return False
+
+
 def stop_tg_proxy_detached() -> None:
     if TG_PROXY_PID_FILE.exists():
         try:
@@ -1417,7 +1685,7 @@ def stop_tg_proxy_detached() -> None:
             if pid > 0 and pid in iter_processes():
                 if IS_WINDOWS:
                     subprocess.run(
-                        ["taskkill", "/f", "/pid", str(pid)],
+                        ["taskkill", "/f", "/t", "/pid", str(pid)],
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
                         creationflags=CREATE_NO_WINDOW,
@@ -1677,6 +1945,414 @@ def scan_and_exclude_active_connections() -> dict:
         "file": str(exclude_file),
         "restarted": restarted,
     }
+
+
+class _PinnedGitHubHandler(urllib.request.HTTPSHandler):
+    _HOSTS = {
+        "raw.githubusercontent.com": "185.199.109.133",
+        "release-assets.githubusercontent.com": "185.199.109.133",
+    }
+
+    def https_open(self, req):
+        host = req.host.split(":")[0]
+        pinned = self._HOSTS.get(host)
+        if not pinned:
+            return super().https_open(req)
+
+        class _Conn(http.client.HTTPSConnection):
+            def connect(self):
+                self.sock = socket.create_connection((pinned, self.port or 443), self.timeout, self.source_address)
+                if self._tunnel_host:
+                    self._tunnel()
+                self.sock = self._context.wrap_socket(self.sock, server_hostname=self._tunnel_host or self.host)
+
+        try:
+            return self.do_open(_Conn, req, context=self._context)
+        except Exception:
+            return super().https_open(req)
+
+
+def _valid_ips(items: object, version: int, limit: int = 2) -> list[str]:
+    out: list[str] = []
+    if not isinstance(items, list):
+        return out
+    for raw in items:
+        s = str(raw or "").strip()
+        try:
+            ip = ipaddress.ip_address(s)
+            if ip.version == version and s not in out:
+                out.append(s)
+                if len(out) >= limit:
+                    break
+        except ValueError:
+            continue
+    return out
+
+
+def fetch_dns_ai_endpoints(timeout: int = 8) -> dict:
+    opener = urllib.request.build_opener(_PinnedGitHubHandler(context=ssl.create_default_context()))
+    for url in DNS_AI_MANIFESTS:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": f"Unfit-Zapret/{APP_VERSION}"})
+            with opener.open(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+            v4 = _valid_ips(data.get("v4"), 4, limit=2)
+            v6 = _valid_ips(data.get("v6"), 6, limit=2)
+            retired = [str(x).strip() for x in (data.get("retired") or []) if str(x).strip()]
+            if v4:
+                return {"v4": v4, "v6": v6, "retired": retired, "source": url}
+        except Exception:
+            continue
+    return {
+        "v4": list(DNS_AI_BUILTIN_V4),
+        "v6": list(DNS_AI_BUILTIN_V6),
+        "retired": list(DNS_AI_RETIRED),
+        "source": "builtin",
+    }
+
+
+def get_windows_build_number() -> int:
+    if not IS_WINDOWS:
+        return 0
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion") as k:
+            val, _ = winreg.QueryValueEx(k, "CurrentBuildNumber")
+            return int(str(val).strip())
+    except Exception:
+        return 0
+
+
+def _load_dns_ai_known_ips() -> list[str]:
+    ips = list(DNS_AI_BUILTIN_V4)
+    if DNS_AI_STATE_FILE.exists():
+        try:
+            st = json.loads(DNS_AI_STATE_FILE.read_text(encoding="utf-8"))
+            for ip in st.get("v4") or []:
+                if ip not in ips:
+                    ips.append(str(ip))
+        except Exception:
+            pass
+    return ips
+
+
+def _save_dns_ai_state(v4: list[str], v6: list[str], retired: list[str]) -> None:
+    try:
+        WORK_DIR.mkdir(parents=True, exist_ok=True)
+        DNS_AI_STATE_FILE.write_text(
+            json.dumps({"v4": v4, "v6": v6, "retired": retired}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def get_dns_ai_status() -> dict:
+    if IS_WINDOWS:
+        build = get_windows_build_number()
+        if build >= 22000:
+            known_v4 = set(_load_dns_ai_known_ips())
+            base_key = r"SYSTEM\CurrentControlSet\Services\Dnscache\InterfaceSpecificParameters"
+            enabled = False
+            try:
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base_key) as root_k:
+                    cnt = winreg.QueryInfoKey(root_k)[0]
+                    for i in range(cnt):
+                        guid = winreg.EnumKey(root_k, i)
+                        ns_tokens: set[str] = set()
+                        try:
+                            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, rf"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\{guid}") as ik:
+                                ns_val, _ = winreg.QueryValueEx(ik, "NameServer")
+                                ns_tokens = {p.strip() for p in re.split(r"[\s,;]+", str(ns_val)) if p.strip()}
+                        except OSError:
+                            pass
+                        for ip in known_v4:
+                            if ip not in ns_tokens:
+                                continue
+                            try:
+                                with winreg.OpenKey(root_k, rf"{guid}\DohInterfaceSettings\Doh\{ip}") as dk:
+                                    flags, _ = winreg.QueryValueEx(dk, "DohFlags")
+                                    if int(flags) & 1:
+                                        enabled = True
+                                        break
+                            except OSError:
+                                continue
+                        if enabled:
+                            break
+            except OSError:
+                pass
+            return {"enabled": enabled, "mode": "Win11 DoH", "template": DNS_AI_TEMPLATE, "build": build}
+
+        exe_pf = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "DNS-AI" / "DNS-AI.exe"
+        svc_exists = False
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services\DNS-AI"):
+                svc_exists = True
+        except OSError:
+            pass
+        return {"enabled": svc_exists and exe_pf.exists(), "mode": "DNS-AI Client", "template": DNS_AI_TEMPLATE, "build": build}
+
+    resolved_dropin = Path("/etc/systemd/resolved.conf.d/dns-ai.conf")
+    stubby_cfg = Path("/etc/stubby/stubby.yml")
+    if resolved_dropin.is_file():
+        return {"enabled": True, "mode": "DoT (resolved)", "template": DNS_AI_TLS_HOST, "build": 0}
+    if stubby_cfg.is_file() and "DNS-AI" in stubby_cfg.read_text(encoding="utf-8", errors="ignore"):
+        return {"enabled": True, "mode": "DoT (stubby)", "template": DNS_AI_TLS_HOST, "build": 0}
+    return {"enabled": False, "mode": "DoT", "template": DNS_AI_TLS_HOST, "build": 0}
+
+
+def _ps_array_literal(items: list[str]) -> str:
+    if not items:
+        return "@()"
+    return "@(" + ", ".join(_ps_quote(x) for x in items) + ")"
+
+
+def _build_win11_enable_ps(v4: list[str], v6: list[str]) -> str:
+    return (
+        f"$Template = {_ps_quote(DNS_AI_TEMPLATE)}\n"
+        f"$V4 = {_ps_array_literal(v4)}\n"
+        f"$V6 = {_ps_array_literal(v6)}\n"
+        "$DohKey = 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Dnscache\\InterfaceSpecificParameters'\n"
+        "$SkipName = 'Hyper-V|VMware|VirtualBox|WSL|vEthernet|TAP|WireGuard|Wintun|Tailscale|ZeroTier|Amnezia|OpenVPN|Loopback|Virtual'\n"
+        "$adapters = @(Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and -not $_.Virtual -and $_.Name -notmatch $SkipName -and $_.InterfaceDescription -notmatch $SkipName })\n"
+        "if ($adapters.Count -eq 0) { throw 'Не найдено активных физических сетевых адаптеров' }\n"
+        "foreach ($ip in $V4 + $V6) {\n"
+        "    if (Get-DnsClientDohServerAddress -ServerAddress $ip -ErrorAction SilentlyContinue) {\n"
+        "        Set-DnsClientDohServerAddress -ServerAddress $ip -DohTemplate $Template -AllowFallbackToUdp $false -AutoUpgrade $true | Out-Null\n"
+        "    } else {\n"
+        "        Add-DnsClientDohServerAddress -ServerAddress $ip -DohTemplate $Template -AllowFallbackToUdp $false -AutoUpgrade $true | Out-Null\n"
+        "    }\n"
+        "}\n"
+        "$names = @()\n"
+        "foreach ($a in $adapters) {\n"
+        "    $hasV6 = $false\n"
+        "    $b = Get-NetAdapterBinding -Name $a.Name -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue\n"
+        "    if ($b -and $b.Enabled) { $hasV6 = $true }\n"
+        "    $servers = if ($hasV6 -and $V6.Count -gt 0) { @($V4 + $V6) } else { @($V4) }\n"
+        "    Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex -ServerAddresses $servers\n"
+        "    $sets = @(@{ Fam = 'Doh'; Ips = $V4 })\n"
+        "    if ($hasV6 -and $V6.Count -gt 0) { $sets += @{ Fam = 'Doh6'; Ips = $V6 } }\n"
+        "    foreach ($s in $sets) {\n"
+        "        $k = Join-Path $DohKey (\"{0}\\DohInterfaceSettings\\{1}\" -f $a.InterfaceGuid, $s.Fam)\n"
+        "        if (Test-Path $k) {\n"
+        "            Get-ChildItem $k | Where-Object { $s.Ips -notcontains $_.PSChildName } | Remove-Item -Recurse -Force\n"
+        "        }\n"
+        "        foreach ($ip in $s.Ips) {\n"
+        "            $ik = Join-Path $k $ip\n"
+        "            if (-not (Test-Path $ik)) { New-Item -Path $ik -Force | Out-Null }\n"
+        "            New-ItemProperty -Path $ik -Name 'DohFlags' -PropertyType QWord -Value 1 -Force | Out-Null\n"
+        "        }\n"
+        "    }\n"
+        "    Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex -ServerAddresses $servers\n"
+        "    $names += $a.Name\n"
+        "}\n"
+        "Clear-DnsClientCache\n"
+        "Write-Output ($names -join ', ')\n"
+    )
+
+
+def _build_win11_disable_ps(ours: list[str]) -> str:
+    return (
+        f"$Ours = {_ps_array_literal(ours)}\n"
+        "$DohKey = 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Dnscache\\InterfaceSpecificParameters'\n"
+        "$SkipName = 'Hyper-V|VMware|VirtualBox|WSL|vEthernet|TAP|WireGuard|Wintun|Tailscale|ZeroTier|Amnezia|OpenVPN|Loopback|Virtual'\n"
+        "$adapters = @(Get-NetAdapter | Where-Object { -not $_.Virtual -and $_.Name -notmatch $SkipName -and $_.InterfaceDescription -notmatch $SkipName })\n"
+        "$names = @()\n"
+        "foreach ($a in $adapters) {\n"
+        "    $touched = $false\n"
+        "    if ($a.Status -eq 'Up') {\n"
+        "        Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex -ResetServerAddresses\n"
+        "        $touched = $true\n"
+        "    }\n"
+        "    foreach ($fam in 'Doh', 'Doh6') {\n"
+        "        $k = Join-Path $DohKey (\"{0}\\DohInterfaceSettings\\{1}\" -f $a.InterfaceGuid, $fam)\n"
+        "        foreach ($ip in $Ours) {\n"
+        "            $ik = Join-Path $k $ip\n"
+        "            if (Test-Path $ik) {\n"
+        "                Remove-Item $ik -Recurse -Force\n"
+        "                $touched = $true\n"
+        "            }\n"
+        "        }\n"
+        "    }\n"
+        "    if ($touched) { $names += $a.Name }\n"
+        "}\n"
+        "foreach ($ip in $Ours) {\n"
+        "    if (Get-DnsClientDohServerAddress -ServerAddress $ip -ErrorAction SilentlyContinue) {\n"
+        "        Remove-DnsClientDohServerAddress -ServerAddress $ip -ErrorAction SilentlyContinue\n"
+        "    }\n"
+        "}\n"
+        "Clear-DnsClientCache\n"
+        "Write-Output ($names -join ', ')\n"
+    )
+
+
+def _download_dns_ai_exe(dst: Path) -> tuple[bool, str]:
+    opener = urllib.request.build_opener(_PinnedGitHubHandler(context=ssl.create_default_context()))
+    try:
+        req = urllib.request.Request(DNS_AI_WIN_EXE_URL, headers={"User-Agent": f"Unfit-Zapret/{APP_VERSION}"})
+        with opener.open(req, timeout=60) as resp:
+            data = resp.read()
+        if len(data) < 200_000 or not data.startswith(b"MZ"):
+            return False, "Скачанный DNS-AI.exe повреждён"
+        dst.write_bytes(data)
+        return True, ""
+    except Exception as e:
+        res = subprocess.run(
+            [CURL_EXE, "-fL", "--silent", "--show-error", "--max-time", "60", "-o", str(dst), DNS_AI_WIN_EXE_URL],
+            capture_output=True,
+            creationflags=CREATE_NO_WINDOW if IS_WINDOWS else 0,
+            timeout=65,
+        )
+        if res.returncode == 0 and dst.exists() and dst.stat().st_size >= 200_000:
+            return True, ""
+        return False, str(e)
+
+
+def enable_dns_ai() -> tuple[bool, str]:
+    ensure_files_exist()
+    ep = fetch_dns_ai_endpoints()
+    v4, v6, retired = ep["v4"], ep["v6"], ep["retired"]
+    _save_dns_ai_state(v4, v6, retired)
+
+    if IS_WINDOWS:
+        if not is_admin():
+            return False, "Нужны права Администратора для настройки DNS-AI"
+        build = get_windows_build_number()
+        if build >= 22000:
+            rc, out, err = _run_powershell(_build_win11_enable_ps(v4, v6), timeout=30)
+            if rc == 0:
+                return True, f"DNS-AI (Win11 DoH) включён для: {out or 'активных адаптеров'}. Проверьте dns-ai.ru/ip"
+            return False, f"Ошибка настройки Win11 DoH: {err or out or rc}"
+
+        exe_pf = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "DNS-AI" / "DNS-AI.exe"
+        exe_tmp = WORK_DIR / "DNS-AI-installer.exe"
+        runner = exe_pf if exe_pf.is_file() else exe_tmp
+        if not runner.is_file():
+            ok_dl, err_dl = _download_dns_ai_exe(exe_tmp)
+            if not ok_dl:
+                return False, f"Не удалось скачать DNS-AI.exe: {err_dl}"
+            runner = exe_tmp
+        try:
+            res = subprocess.run(
+                [str(runner), "setup"],
+                capture_output=True,
+                creationflags=CREATE_NO_WINDOW,
+                stdin=subprocess.DEVNULL,
+                timeout=45,
+            )
+            if res.returncode == 0:
+                return True, "Клиент DNS-AI установлен и запущен для Windows 10"
+            msg = (res.stderr or res.stdout or b"").decode("utf-8", errors="ignore").strip()
+            return False, f"DNS-AI setup завершился с кодом {res.returncode}: {msg}"
+        except Exception as e:
+            return False, f"Ошибка запуска DNS-AI.exe: {e}"
+
+    # Linux DoT через systemd-resolved + NetworkManager
+    if not is_admin():
+        return False, "Требуются права root для настройки systemd-resolved"
+    state_dir = Path("/etc/dns-ai")
+    dropin = Path("/etc/systemd/resolved.conf.d/dns-ai.conf")
+    resolv = Path("/etc/resolv.conf")
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        dropin.parent.mkdir(parents=True, exist_ok=True)
+        has_v6 = False
+        ip_bin = shutil.which("ip")
+        if ip_bin:
+            r6 = subprocess.run([ip_bin, "-6", "addr", "show", "scope", "global"], capture_output=True, text=True, timeout=3)
+            has_v6 = bool(r6.stdout.strip())
+        srv_ips = list(v4) + (list(v6) if has_v6 else [])
+        srv_str = " ".join(f"{ip}#{DNS_AI_TLS_HOST}" for ip in srv_ips)
+        dropin.write_text(f"# DNS-AI\n[Resolve]\nDNS={srv_str}\nDNSOverTLS=yes\nDomains=~.\nFallbackDNS=\n", encoding="utf-8")
+
+        if shutil.which("nmcli"):
+            nm_res = subprocess.run(["nmcli", "-t", "-f", "UUID,TYPE,DEVICE", "connection", "show", "--active"], capture_output=True, text=True, timeout=5)
+            saved_uuids = state_dir / "nm-connections"
+            existing = set(saved_uuids.read_text(encoding="utf-8").splitlines()) if saved_uuids.exists() else set()
+            for row in nm_res.stdout.splitlines():
+                parts = row.split(":", 2)
+                if len(parts) < 3:
+                    continue
+                uuid, ctype, dev = parts
+                if any(bad in ctype for bad in ("loopback", "bridge", "tun", "wireguard", "vpn", "docker", "dummy")) or not ctype:
+                    continue
+                subprocess.run(["nmcli", "connection", "modify", uuid, "ipv4.ignore-auto-dns", "yes", "ipv6.ignore-auto-dns", "yes"], capture_output=True, timeout=5)
+                if dev:
+                    subprocess.run(["nmcli", "device", "reapply", dev], capture_output=True, timeout=5)
+                existing.add(uuid)
+            if existing:
+                saved_uuids.write_text("\n".join(sorted(existing)) + "\n", encoding="utf-8")
+
+        subprocess.run(["systemctl", "enable", "systemd-resolved"], capture_output=True, timeout=10)
+        subprocess.run(["systemctl", "restart", "systemd-resolved"], capture_output=True, timeout=15)
+        if not (resolv.is_symlink() and "systemd/resolve" in str(os.readlink(resolv))):
+            if resolv.is_symlink() and not (state_dir / "resolv.conf.link").exists():
+                (state_dir / "resolv.conf.link").write_text(os.readlink(resolv), encoding="utf-8")
+            elif resolv.is_file() and not (state_dir / "resolv.conf.bak").exists():
+                shutil.copy2(resolv, state_dir / "resolv.conf.bak")
+            resolv.unlink(missing_ok=True)
+            os.symlink("/run/systemd/resolve/stub-resolv.conf", resolv)
+        return True, "DNS-AI (systemd-resolved DoT) включён"
+    except Exception as e:
+        return False, f"Ошибка настройки DNS-AI на Linux (см. https://dns-ai.ru/#setup): {e}"
+
+
+def disable_dns_ai() -> tuple[bool, str]:
+    ours = list(dict.fromkeys(list(DNS_AI_BUILTIN_V4) + list(DNS_AI_BUILTIN_V6) + list(DNS_AI_RETIRED)))
+    if DNS_AI_STATE_FILE.exists():
+        try:
+            st = json.loads(DNS_AI_STATE_FILE.read_text(encoding="utf-8"))
+            for key in ("v4", "v6", "retired"):
+                for ip in st.get(key) or []:
+                    if ip not in ours:
+                        ours.append(str(ip))
+        except Exception:
+            pass
+
+    if IS_WINDOWS:
+        if not is_admin():
+            return False, "Нужны права Администратора для отключения DNS-AI"
+        build = get_windows_build_number()
+        if build >= 22000:
+            rc, out, err = _run_powershell(_build_win11_disable_ps(ours), timeout=30)
+            if rc == 0:
+                return True, f"Настройки DNS-AI удалены ({out or 'возвращён DHCP'})"
+            return False, f"Ошибка отключения DNS-AI: {err or out or rc}"
+
+        exe_pf = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "DNS-AI" / "DNS-AI.exe"
+        exe_tmp = WORK_DIR / "DNS-AI-installer.exe"
+        runner = exe_pf if exe_pf.is_file() else exe_tmp
+        if not runner.is_file():
+            return False, "Не найден DNS-AI.exe для удаления службы"
+        res = subprocess.run([str(runner), "remove"], capture_output=True, creationflags=CREATE_NO_WINDOW, stdin=subprocess.DEVNULL, timeout=30)
+        if res.returncode == 0:
+            return True, "Служба DNS-AI удалена"
+        return False, f"Ошибка удаления DNS-AI ({res.returncode})"
+
+    if not is_admin():
+        return False, "Требуются права root"
+    state_dir = Path("/etc/dns-ai")
+    dropin = Path("/etc/systemd/resolved.conf.d/dns-ai.conf")
+    resolv = Path("/etc/resolv.conf")
+    try:
+        dropin.unlink(missing_ok=True)
+        subprocess.run(["systemctl", "restart", "systemd-resolved"], capture_output=True, timeout=15)
+        nm_file = state_dir / "nm-connections"
+        if nm_file.exists() and shutil.which("nmcli"):
+            for uuid in nm_file.read_text(encoding="utf-8").splitlines():
+                uuid = uuid.strip()
+                if not uuid:
+                    continue
+                subprocess.run(["nmcli", "connection", "modify", uuid, "ipv4.ignore-auto-dns", "no", "ipv6.ignore-auto-dns", "no"], capture_output=True, timeout=5)
+        if (state_dir / "resolv.conf.link").exists():
+            resolv.unlink(missing_ok=True)
+            os.symlink((state_dir / "resolv.conf.link").read_text(encoding="utf-8").strip(), resolv)
+        elif (state_dir / "resolv.conf.bak").exists():
+            resolv.unlink(missing_ok=True)
+            shutil.copy2(state_dir / "resolv.conf.bak", resolv)
+        shutil.rmtree(state_dir, ignore_errors=True)
+        return True, "Настройки DNS-AI удалены"
+    except Exception as e:
+        return False, f"Ошибка отключения DNS-AI: {e}"
 
 
 def fetch_github_avatar(timeout: int = 4) -> Optional[bytes]:

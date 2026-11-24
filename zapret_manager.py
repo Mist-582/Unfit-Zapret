@@ -89,7 +89,7 @@ from PyQt6.QtWidgets import (
 )
 
 import zapret_core as core
-from tg_proxy import TgProxyService
+from tg_proxy import TgProxyService, probe_proxy
 
 
 APP_TITLE = f"{core.APP_NAME} v{core.APP_VERSION}"
@@ -1046,6 +1046,8 @@ class MainWindow(QMainWindow):
         self.setWindowIcon(self.icon_idle)
 
         core.ensure_files_exist()
+        core.stop_tg_proxy_detached()
+        install_notes = core.ensure_installed_and_shortcut()
         cfg_init = core.load_config()
         if not cfg_init.get("tg_proxy_secret"):
             core.ensure_tg_secret(cfg_init)
@@ -1055,6 +1057,9 @@ class MainWindow(QMainWindow):
         self._apply_theme_cursors(self)
         self._setup_tray()
         self._setup_timers()
+
+        for note in install_notes:
+            self.append_log(note)
 
         if cfg_init.get("tg_proxy_enabled", True):
             self._ensure_tg_proxy_started(cfg_init)
@@ -1305,19 +1310,61 @@ class MainWindow(QMainWindow):
         tg_lay.addWidget(self.dash_tg_stats)
 
         tg_btns = QHBoxLayout()
-        tg_btns.setSpacing(8)
-        self.btn_tg_toggle = QPushButton("Запустить Мост", objectName="AccentBtn")
+        tg_btns.setSpacing(6)
+        self.btn_tg_toggle = QPushButton("Запустить", objectName="AccentBtn")
         self.btn_tg_toggle.clicked.connect(self._on_toggle_tg_proxy)
-        self.btn_tg_open = QPushButton("Открыть в Telegram", objectName="PrimaryStart")
+        self.btn_tg_open = QPushButton("Открыть Telegram", objectName="PrimaryStart")
         self.btn_tg_open.clicked.connect(self._on_open_tg_link)
         self.btn_tg_copy = QPushButton("Копировать", objectName="SecondaryBtn")
         self.btn_tg_copy.clicked.connect(self._on_copy_tg_link)
+        self.btn_tg_test = QPushButton("Тест", objectName="SecondaryBtn")
+        self.btn_tg_test.clicked.connect(self._on_test_tg_proxy)
         tg_btns.addWidget(self.btn_tg_toggle)
         tg_btns.addWidget(self.btn_tg_open)
         tg_btns.addWidget(self.btn_tg_copy)
+        tg_btns.addWidget(self.btn_tg_test)
         tg_btns.addStretch(1)
         tg_lay.addLayout(tg_btns)
         lay.addWidget(tg_card)
+
+        dns_card = QFrame(objectName="Card")
+        dns_lay = QVBoxLayout(dns_card)
+        dns_lay.setContentsMargins(18, 14, 18, 14)
+        dns_lay.setSpacing(8)
+        dns_top = QHBoxLayout()
+        dns_top.setSpacing(10)
+        dns_sec_lbl = QLabel("DNS-AI • Нейросети без VPN (ChatGPT, Claude, Gemini)", objectName="SectionTitle")
+        dns_sec_lbl.setWordWrap(True)
+        dns_top.addWidget(dns_sec_lbl, 1)
+        self.dash_dns_ai_status = QLabel("● Отключён")
+        self.dash_dns_ai_status.setStyleSheet("color: #A79AB8; font-size: 12px; font-weight: 700;")
+        dns_top.addWidget(self.dash_dns_ai_status)
+        dns_lay.addLayout(dns_top)
+
+        dns_sub = QLabel(
+            "Шифрованный DNS (dns-ai.ru): работа ИИ без VPN, ошибок региона и замедления трафика",
+            objectName="Muted",
+        )
+        dns_sub.setWordWrap(True)
+        dns_lay.addWidget(dns_sub)
+
+        dns_btns = QHBoxLayout()
+        dns_btns.setSpacing(6)
+        self.btn_dns_ai_toggle = QPushButton("Включить", objectName="AccentBtn")
+        self.btn_dns_ai_toggle.clicked.connect(self._on_toggle_dns_ai)
+        btn_dns_copy = QPushButton("DoH URL", objectName="SecondaryBtn")
+        btn_dns_copy.clicked.connect(self._on_copy_dns_ai_doh)
+        btn_dns_check = QPushButton("Проверка", objectName="SecondaryBtn")
+        btn_dns_check.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("https://dns-ai.ru/ip")))
+        btn_dns_site = QPushButton("dns-ai.ru", objectName="SecondaryBtn")
+        btn_dns_site.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("https://dns-ai.ru/#setup")))
+        dns_btns.addWidget(self.btn_dns_ai_toggle)
+        dns_btns.addWidget(btn_dns_copy)
+        dns_btns.addWidget(btn_dns_check)
+        dns_btns.addWidget(btn_dns_site)
+        dns_btns.addStretch(1)
+        dns_lay.addLayout(dns_btns)
+        lay.addWidget(dns_card)
 
         test_card = QFrame(objectName="Card")
         test_lay = QVBoxLayout(test_card)
@@ -1638,10 +1685,13 @@ class MainWindow(QMainWindow):
         t_col.addWidget(logs_sub)
         top.addLayout(t_col, 1)
 
+        btn_mk_shortcut = QPushButton("Ярлык на рабочий стол", objectName="SecondaryBtn")
+        btn_mk_shortcut.clicked.connect(self._on_create_shortcut)
         btn_open_dir = QPushButton("Открыть папку", objectName="SecondaryBtn")
         btn_open_dir.clicked.connect(self._on_open_work_dir)
         btn_clear_log = QPushButton("Очистить журнал", objectName="SecondaryBtn")
         btn_clear_log.clicked.connect(lambda: self.log_view.clear())
+        top.addWidget(btn_mk_shortcut)
         top.addWidget(btn_open_dir)
         top.addWidget(btn_clear_log)
         lay.addLayout(top)
@@ -1864,11 +1914,9 @@ class MainWindow(QMainWindow):
     def _ensure_tg_proxy_started(self, cfg: dict) -> tuple[bool, str]:
         port = int(cfg.get("tg_proxy_port", 1443) or 1443)
         secret = core.ensure_tg_secret(cfg)
-        self.tg_proxy._host = "127.0.0.1"
-        self.tg_proxy._port = port
-        self.tg_proxy._secret_hex = secret
-        if self.tg_proxy.is_running() or core.is_tg_proxy_port_open(port):
+        if self.tg_proxy.is_running() and self.tg_proxy._port == port and self.tg_proxy._secret_hex == secret:
             return True, f"Telegram WS-Мост уже работает на 127.0.0.1:{port}"
+        core.stop_tg_proxy_detached()
         return self.tg_proxy.start("127.0.0.1", port, secret)
 
     def _refresh_tg_ui(self):
@@ -1876,14 +1924,14 @@ class MainWindow(QMainWindow):
         port = int(cfg.get("tg_proxy_port", 1443) or 1443)
         st = self.tg_proxy.get_stats()
         in_proc = st["running"]
-        ext_up = (not in_proc) and core.is_tg_proxy_port_open(port)
+        ext_up = (not in_proc) and core.is_tg_proxy_detached_running()
         active = in_proc or ext_up
         if active:
             mode_note = f"127.0.0.1:{st['port'] if in_proc else port}"
             self.dash_tg_status.setText(f"● Активен ({mode_note})")
             self.dash_tg_status.setStyleSheet("color: #34D399; font-size: 12px; font-weight: 700;")
-            self.btn_tg_toggle.setText("Остановить Мост")
-            self.btn_tg_toggle.setObjectName("DangerStop")
+            self.btn_tg_toggle.setText("Остановить")
+            want_obj = "DangerStop"
             if in_proc:
                 self.dash_tg_stats.setText(
                     f"Трафик: WS {st['ws']} | CF {st['cf']} | TCP {st['tcp']} | "
@@ -1894,17 +1942,18 @@ class MainWindow(QMainWindow):
         else:
             self.dash_tg_status.setText("● Остановлен")
             self.dash_tg_status.setStyleSheet("color: #FB7185; font-size: 12px; font-weight: 700;")
-            self.btn_tg_toggle.setText("Запустить Мост")
-            self.btn_tg_toggle.setObjectName("AccentBtn")
+            self.btn_tg_toggle.setText("Запустить")
+            want_obj = "AccentBtn"
             err = st.get("last_error") or "Локальный MTProto-мост через WebSocket (без сторонних VPN)"
             self.dash_tg_stats.setText(err)
-        self.btn_tg_toggle.style().unpolish(self.btn_tg_toggle)
-        self.btn_tg_toggle.style().polish(self.btn_tg_toggle)
+        if self.btn_tg_toggle.objectName() != want_obj:
+            self.btn_tg_toggle.setObjectName(want_obj)
+            self.btn_tg_toggle.style().unpolish(self.btn_tg_toggle)
+            self.btn_tg_toggle.style().polish(self.btn_tg_toggle)
 
     def _on_toggle_tg_proxy(self):
         cfg = core.load_config()
-        port = int(cfg.get("tg_proxy_port", 1443) or 1443)
-        if self.tg_proxy.is_running() or core.is_tg_proxy_port_open(port):
+        if self.tg_proxy.is_running() or core.is_tg_proxy_detached_running():
             self.tg_proxy.stop()
             core.stop_tg_proxy_detached()
             self.append_log("Telegram WS-Мост остановлен.")
@@ -1930,13 +1979,21 @@ class MainWindow(QMainWindow):
         self._refresh_tg_ui()
         link = self.tg_proxy.get_tg_link()
         if link:
-            QDesktopServices.openUrl(QUrl(link))
-            self.append_log("Открыта ссылка подключения прокси в Telegram Desktop.")
+            opened = QDesktopServices.openUrl(QUrl(link))
+            if opened:
+                self.append_log("Открыта ссылка подключения прокси в Telegram Desktop.")
+            else:
+                cb = QApplication.clipboard()
+                if cb is not None:
+                    cb.setText(link)
+                self.append_log("Протокол tg:// не открылся; ссылка скопирована в буфер обмена.")
+                QMessageBox.information(self, "Telegram WS-Мост", f"Ссылка скопирована (вставьте в Telegram):\n{link}")
 
     def _on_copy_tg_link(self):
         cfg = core.load_config()
+        old_secret = cfg.get("tg_proxy_secret", "")
         secret = core.ensure_tg_secret(cfg)
-        if cfg.get("tg_proxy_secret") == secret:
+        if old_secret != secret:
             core.save_config(cfg)
         port = int(cfg.get("tg_proxy_port", 1443) or 1443)
         link = f"tg://proxy?server=127.0.0.1&port={port}&secret=dd{secret}"
@@ -1945,6 +2002,101 @@ class MainWindow(QMainWindow):
             cb.setText(link)
         self.append_log("Ссылка MTProto-прокси скопирована в буфер обмена.")
         QMessageBox.information(self, "Telegram WS-Мост", f"Ссылка скопирована:\n{link}")
+
+    def _on_test_tg_proxy(self):
+        cfg = core.load_config()
+        if not cfg.get("tg_proxy_secret"):
+            core.ensure_tg_secret(cfg)
+            core.save_config(cfg)
+        if not self.tg_proxy.is_running() and not core.is_tg_proxy_detached_running():
+            ok, msg = self._ensure_tg_proxy_started(cfg)
+            if not ok:
+                QMessageBox.warning(self, "Тест Telegram WS-Моста", msg)
+                self._refresh_tg_ui()
+                return
+        port = int(cfg.get("tg_proxy_port", 1443) or 1443)
+        secret = cfg.get("tg_proxy_secret", "")
+        self.btn_tg_test.setEnabled(False)
+        self.btn_tg_test.setText("Проверка...")
+        self.dash_tg_stats.setText("Проверка соединения Telegram WS-Моста (DC2)...")
+        self.append_log("Запущена самопроверка Telegram WS-Моста (DC2)...")
+        self._run_bg(probe_proxy, self._after_test_tg_proxy, "127.0.0.1", port, secret)
+
+    def _after_test_tg_proxy(self, res):
+        self.btn_tg_test.setEnabled(True)
+        self.btn_tg_test.setText("Тест")
+        ok_call, payload = res
+        if not ok_call:
+            msg = f"Ошибка теста TG-Моста: {payload}"
+            self.append_log(msg)
+            self.dash_tg_stats.setText(f"✕ {msg}")
+            QMessageBox.warning(self, "Тест Telegram WS-Моста", msg)
+            return
+        ok, _, msg = payload
+        self.append_log(f"[TG-Мост тест] {msg}")
+        self.dash_tg_stats.setText(f"{'✓' if ok else '✕'} {msg}")
+        if ok:
+            QMessageBox.information(self, "Тест Telegram WS-Моста", msg)
+        else:
+            QMessageBox.warning(self, "Тест Telegram WS-Моста", msg)
+
+    def _refresh_dns_ai_ui(self):
+        st = core.get_dns_ai_status()
+        if st["enabled"]:
+            self.dash_dns_ai_status.setText(f"● Включён ({st['mode']})")
+            self.dash_dns_ai_status.setStyleSheet("color: #34D399; font-size: 12px; font-weight: 700;")
+            self.btn_dns_ai_toggle.setText("Отключить")
+            want_obj = "DangerStop"
+        else:
+            self.dash_dns_ai_status.setText("● Отключён")
+            self.dash_dns_ai_status.setStyleSheet("color: #A79AB8; font-size: 12px; font-weight: 700;")
+            self.btn_dns_ai_toggle.setText("Включить")
+            want_obj = "AccentBtn"
+        if self.btn_dns_ai_toggle.objectName() != want_obj:
+            self.btn_dns_ai_toggle.setObjectName(want_obj)
+            self.btn_dns_ai_toggle.style().unpolish(self.btn_dns_ai_toggle)
+            self.btn_dns_ai_toggle.style().polish(self.btn_dns_ai_toggle)
+
+    def _on_toggle_dns_ai(self):
+        st = core.get_dns_ai_status()
+        self.btn_dns_ai_toggle.setEnabled(False)
+        self.btn_dns_ai_toggle.setText("Настройка...")
+        if st["enabled"]:
+            self.append_log("Отключение DNS-AI и возврат системного DNS...")
+            self._run_bg(core.disable_dns_ai, self._after_toggle_dns_ai)
+        else:
+            self.append_log("Настройка шифрованного DNS-AI (dns-ai.ru)...")
+            self._run_bg(core.enable_dns_ai, self._after_toggle_dns_ai)
+
+    def _after_toggle_dns_ai(self, res):
+        self.btn_dns_ai_toggle.setEnabled(True)
+        self._refresh_dns_ai_ui()
+        ok_call, payload = res
+        if ok_call:
+            ok, msg = payload
+            self.append_log(msg)
+            if ok:
+                QMessageBox.information(self, "DNS-AI", msg)
+            else:
+                QMessageBox.warning(self, "DNS-AI", msg)
+        else:
+            self.append_log(f"Ошибка DNS-AI: {payload}")
+            QMessageBox.warning(self, "DNS-AI", str(payload))
+
+    def _on_copy_dns_ai_doh(self):
+        cb = QApplication.clipboard()
+        if cb is not None:
+            cb.setText(core.DNS_AI_TEMPLATE)
+        self.append_log(f"DoH-адрес скопирован: {core.DNS_AI_TEMPLATE}")
+        QMessageBox.information(self, "DNS-AI", f"Адрес DoH скопирован в буфер:\n{core.DNS_AI_TEMPLATE}")
+
+    def _on_create_shortcut(self):
+        ok, msg = core.create_desktop_shortcut()
+        self.append_log(msg)
+        if ok:
+            QMessageBox.information(self, "Ярлык", msg)
+        else:
+            QMessageBox.warning(self, "Ярлык", msg)
 
     def _apply_running_visuals(self, running: bool):
         icon = self.icon_active if running else self.icon_idle
@@ -1998,6 +2150,7 @@ class MainWindow(QMainWindow):
         self.dash_cfg_sni.setText(f"Fake SNI: {cfg.get('fake_sni', 'www.sferum.ru')}")
         self.sb_strat_lbl.setText(f"Стратегия: #{idx if idx else '?'}")
         self._refresh_tg_ui()
+        self._refresh_dns_ai_ui()
 
         info = core.get_autorun_info()
         if info["enabled"]:
@@ -2474,7 +2627,7 @@ class MainWindow(QMainWindow):
         if not cfg["tg_proxy_enabled"]:
             self.tg_proxy.stop()
             core.stop_tg_proxy_detached()
-        elif cfg["tg_proxy_port"] != old_port or not (self.tg_proxy.is_running() or core.is_tg_proxy_port_open(cfg["tg_proxy_port"])):
+        elif cfg["tg_proxy_port"] != old_port or not (self.tg_proxy.is_running() or core.is_tg_proxy_detached_running()):
             self.tg_proxy.stop()
             core.stop_tg_proxy_detached()
             self._ensure_tg_proxy_started(cfg)

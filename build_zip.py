@@ -51,6 +51,9 @@ def build_embedded_assets() -> Path:
                     zf.write(f, f"bin/{f.name}")
         for f in _list_files():
             zf.write(f, f"lists/{f.name}")
+        ico = WORK_DIR / "app_icon.ico"
+        if ico.is_file():
+            zf.write(ico, "app_icon.ico")
     print(f"[OK] Встроенные ресурсы: {EMBEDDED_ZIP} ({EMBEDDED_ZIP.stat().st_size / 1024:.0f} KB)")
     return EMBEDDED_ZIP
 

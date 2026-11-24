@@ -2,15 +2,14 @@
 
 Кроссплатформенный графический менеджер обхода DPI для **Windows** и **Linux** (на базе [zapret](https://github.com/bol-van/zapret) `winws` / `nfqws` и PyQt6).
 
-## Возможности (v2.1.0)
+## Возможности (v2.2.0)
 - **20 актуальных стратегий обхода DPI 2026 года:** 12 свежих пресетов (`ALT13 Sochi`, `ALT11 Sferum 664 + STUN2`, `EXP 480`, `Fake TLS Auto`, `ALT9 Ozon`, `ALT7 SNIExt+1`) и 8 кастомных стратегий `[Unfit AI-1..8]` против ML/ИИ-анализаторов ТСПУ
-- **Двойной обход Telegram:** DPI-десинхронизация веб-версии и прямых подсетей Telegram (`list-telegram.txt`, `ipset-telegram.txt`, порт `5222`) + встроенный **Telegram WS-Мост** (`127.0.0.1:1443`, MTProto ↔ WebSocket с резервом Cloudflare)
+- **Двойной обход Telegram:** DPI-десинхронизация (`list-telegram.txt`, `ipset-telegram.txt`, порт `5222`) + улучшенный **Telegram WS-Мост** (`127.0.0.1:1443`, пре-пул WebSocket, обход блокировок по Cloudflare на порту 443/80 и кнопка самопроверки)
+- **Встроенный DNS-AI (`dns-ai.ru`):** включение шифрованного DNS (DoH на Windows 11 / клиент DNS-AI на Windows 10 / DoT на Linux) в один клик для работы ChatGPT, Claude, Gemini и других нейросетей без VPN
+- **Удобная установка:** все рабочие файлы хранятся в открытой папке `C:\UnfitZapret` с автоматическим созданием ярлыка на рабочем столе и миграцией настроек
 - **Авто-Тюнинг** с параллельной проверкой YouTube, Discord и Telegram и подбором Fake SNI
-- **Кроссплатформенный автозапуск:**
-  - Windows: Планировщик задач (`BootTrigger` + `LogonTrigger` от `SYSTEM`)
-  - Linux: `systemd`-сервис `unfit-zapret.service`
-- **Умные исключения:** домены (`list-exclude-user.txt`) и IP-подсети (`ipset-exclude-user.txt`), сканер активных подключений игр/VPN
-- Проверка обновлений и автообновление из релизов GitHub
+- **Кроссплатформенный автозапуск:** Планировщик задач Windows (`SYSTEM`) и `systemd`-сервис Linux
+- **Умные исключения** и автоматическое обновление прямо из интерфейса
 
 ## Поддерживаемые ОС и архитектуры
 
@@ -27,7 +26,7 @@
 
 ### Windows (64-bit / ARM64)
 1. Скачайте `Unfit-Zapret.exe` из [Releases](https://github.com/Mist-582/Unfit-Zapret/releases/latest).
-2. Запустите файл от имени администратора - рабочие файлы автоматически распакуются в `C:\ProgramData\UnfitZapret`.
+2. Запустите файл от имени администратора — приложение установится в `C:\UnfitZapret` и создаст ярлык на рабочем столе.
 
 ### Windows (32-bit x86)
 1. Скачайте и распакуйте `Unfit-Zapret-win-x86.zip` (требуется Python 3.10+ и `pip install PyQt6`).
