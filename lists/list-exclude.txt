@@ -122,3 +122,5 @@ psbank.ru
 rosbank.ru
 rshb.ru
 tochka.com
+dns-ai.ru
+dns.dns-ai.ru
