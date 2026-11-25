@@ -2,10 +2,10 @@
 
 Кроссплатформенный графический менеджер обхода DPI для **Windows** и **Linux** (на базе [zapret](https://github.com/bol-van/zapret) `winws` / `nfqws` и PyQt6).
 
-## Возможности (v2.2.0)
+## Возможности (v2.2.1)
 - **20 актуальных стратегий обхода DPI 2026 года:** 12 свежих пресетов (`ALT13 Sochi`, `ALT11 Sferum 664 + STUN2`, `EXP 480`, `Fake TLS Auto`, `ALT9 Ozon`, `ALT7 SNIExt+1`) и 8 кастомных стратегий `[Unfit AI-1..8]` против ML/ИИ-анализаторов ТСПУ
 - **Двойной обход Telegram:** DPI-десинхронизация (`list-telegram.txt`, `ipset-telegram.txt`, порт `5222`) + улучшенный **Telegram WS-Мост** (`127.0.0.1:1443`, пре-пул WebSocket, обход блокировок по Cloudflare на порту 443/80 и кнопка самопроверки)
-- **Встроенный DNS-AI (`dns-ai.ru`):** включение шифрованного DNS (DoH на Windows 11 / клиент DNS-AI на Windows 10 / DoT на Linux) в один клик для работы ChatGPT, Claude, Gemini и других нейросетей без VPN
+- **Встроенный DNS-AI (`dns-ai.ru`):** включение шифрованного DNS в один клик с проверкой доступности резолверов (нативный DoH на Windows 11, DNS-AI.exe на Windows 10, DoT на Linux) и исключением доменов Antigravity OAuth/API и IP DNS-AI от DPI-десинхронизации
 - **Удобная установка:** все рабочие файлы хранятся в открытой папке `C:\UnfitZapret` с автоматическим созданием ярлыка на рабочем столе и миграцией настроек
 - **Авто-Тюнинг** с параллельной проверкой YouTube, Discord и Telegram и подбором Fake SNI
 - **Кроссплатформенный автозапуск:** Планировщик задач Windows (`SYSTEM`) и `systemd`-сервис Linux

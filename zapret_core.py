@@ -53,7 +53,7 @@ LINUX_FWMARK = 0x40000000
 LINUX_NFT_TABLE = "unfit_zapret"
 
 APP_NAME = "Unfit Zapret"
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.2.1"
 GITHUB_OWNER = "Mist-582"
 GITHUB_REPO = "Unfit-Zapret"
 GITHUB_AVATAR_URL = f"https://avatars.githubusercontent.com/{GITHUB_OWNER}?s=128"
@@ -976,6 +976,10 @@ def get_winws_args(strategy_str: str, config: dict, log_cb: Optional[Callable[[s
         "--filter-tcp=443",
         f'--hostlist={(LISTS_DIR / "list-google.txt").as_posix()}',
         f'--hostlist={(LISTS_DIR / "list-gemini.txt").as_posix()}',
+        f'--hostlist-exclude={(LISTS_DIR / "list-exclude.txt").as_posix()}',
+        f'--hostlist-exclude={(LISTS_DIR / "list-exclude-user.txt").as_posix()}',
+        f'--ipset-exclude={(LISTS_DIR / "ipset-exclude.txt").as_posix()}',
+        f'--ipset-exclude={(LISTS_DIR / "ipset-exclude-user.txt").as_posix()}',
         "--ip-id=zero",
         *google_fake_args,
         *strat_parts,
@@ -2207,10 +2211,24 @@ def _download_dns_ai_exe(dst: Path) -> tuple[bool, str]:
         return False, str(e)
 
 
+def _check_dns_ai_reachable(ips: list[str], timeout: float = 4.0) -> bool:
+    ctx = ssl.create_default_context()
+    for ip in ips:
+        try:
+            with socket.create_connection((ip, 443), timeout=timeout) as raw:
+                with ctx.wrap_socket(raw, server_hostname=DNS_AI_TLS_HOST):
+                    return True
+        except OSError:
+            continue
+    return False
+
+
 def enable_dns_ai() -> tuple[bool, str]:
     ensure_files_exist()
     ep = fetch_dns_ai_endpoints()
     v4, v6, retired = ep["v4"], ep["v6"], ep["retired"]
+    if not _check_dns_ai_reachable(v4):
+        return False, "Серверы dns.dns-ai.ru сейчас недоступны по TLS:443 — системный DNS не изменён, чтобы не потерять доступ к сети."
     _save_dns_ai_state(v4, v6, retired)
 
     if IS_WINDOWS:
