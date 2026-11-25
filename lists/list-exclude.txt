@@ -124,3 +124,10 @@ rshb.ru
 tochka.com
 dns-ai.ru
 dns.dns-ai.ru
+oauth2.googleapis.com
+accounts.google.com
+cloudcode-pa.googleapis.com
+daily-cloudcode-pa.googleapis.com
+daily-cloudcode-pa.sandbox.googleapis.com
+aicode.googleapis.com
+antigravity.google
